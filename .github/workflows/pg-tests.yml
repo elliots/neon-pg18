@@ -1,0 +1,284 @@
+name: tests
+
+# Runs the Python regression suite on GitHub-hosted runners.
+#
+# Every workflow this repository inherited from upstream Neon lives in
+# .github/workflows-disabled/ and no longer runs: they depend on Neon's
+# self-hosted runners, their container registries and their cloud accounts,
+# none of which exist for this fork. This is the one workflow that does run,
+# and it only needs github-hosted machines.
+#
+# Two things worth knowing if you change this file:
+#
+#  * Build with `--features testing`. Without it the pageserver has no
+#    failpoints, and 274 of the ~840 tests skip themselves with "pageserver was
+#    built without 'testing' feature" -- including test_pg_regress and
+#    test_isolation. A green run without this flag means much less than it looks.
+#
+#  * The suite is sharded across parallel jobs. It is not that any one test is
+#    slow, it is that there are a lot of them and each spins up a pageserver, a
+#    safekeeper and a compute. One build job feeds all the shards so the
+#    (expensive) Postgres + Rust build happens once.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: PostgreSQL major version to test
+        required: false
+        default: v18
+        type: choice
+        options: [ v14, v15, v16, v17, v18 ]
+      shards:
+        description: Number of parallel test shards
+        required: false
+        default: "6"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here publishes anything. Keep the token read-only; the disabled
+# upstream workflows asked for packages:write, which a fork cannot grant unless
+# the repository's default workflow permissions are raised.
+permissions:
+  contents: read
+
+env:
+  PG_VERSION: ${{ inputs.pg_version || 'v18' }}
+  BUILD_TYPE: debug
+  # Upstream's _build-and-test-locally.yml used "testing,rest_broker". The
+  # rest_broker half cannot build in this fork: it needs subzero-core, and
+  # libs/proxy/subzero_core is a stub ("This is a stub for the subzero-core
+  # crate"), so proxy fails with unresolved imports of subzero_core::{api,
+  # config, error, dynamic_statement}. Nothing in test_runner/regress needs it.
+  CARGO_FEATURES: testing
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: build ${{ inputs.pg_version || 'v18' }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/neondatabase/build-tools:pinned-bookworm
+      # --init so that PID 1 reaps. Without a reaper, neon_local's children
+      # become zombies when it stops them, kill(pid, 0) keeps succeeding for a
+      # zombie, and every test teardown fails with
+      # "<name> with pid N did not stop in 10s" despite the process having exited.
+      options: --init --user root
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the Postgres submodules
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # postgres_ffi generates bindings for every supported version, so the
+          # headers for all of them are needed even when testing just one.
+          git submodule update --init --depth 1 --recursive
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ env.PG_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ env.PG_VERSION }}-
+            cargo-${{ runner.os }}-
+
+      - name: Cache the Postgres build
+        uses: actions/cache@v4
+        with:
+          path: |
+            pg_install
+            build
+          key: pg-${{ runner.os }}-${{ env.PG_VERSION }}-${{ hashFiles('vendor/revisions.json') }}
+
+      - name: Build Postgres and the Neon extensions
+        run: |
+          set -eux
+          make -j"$(nproc)" postgres-install-"${PG_VERSION}"
+          make -j"$(nproc)" neon-pg-ext-"${PG_VERSION}"
+
+      - name: Build the Neon binaries
+        run: |
+          set -eux
+          make -j"$(nproc)" neon \
+            CARGO_BUILD_FLAGS="--locked --features ${CARGO_FEATURES}"
+          # Fail loudly rather than skipping 274 tests at run time.
+          ./target/debug/pageserver --version | tee /dev/stderr | grep -q '"testing"'
+
+      - name: Plan the test shards
+        id: plan
+        run: |
+          set -eu
+          n="${{ inputs.shards || '6' }}"
+          echo "shards=$(python3 -c "import json;print(json.dumps(list(range(1,$n+1))))")" >> "$GITHUB_OUTPUT"
+
+      - name: Package what the test jobs need
+        run: |
+          set -eux
+          mkdir -p artifact/target/debug
+          cp -a pg_install artifact/
+          # pg_regress and isolationtester are run out of the build tree.
+          mkdir -p artifact/build
+          cp -a "build/${PG_VERSION}" "artifact/build/${PG_VERSION}"
+          for b in pageserver safekeeper storage_broker storage_controller \
+                   neon_local compute_ctl endpoint_storage pagectl \
+                   storage_scrubber storcon_cli; do
+            [ -x "target/debug/$b" ] && cp "target/debug/$b" artifact/target/debug/
+          done
+          tar -C artifact -cf - . | zstd -T0 -3 -o neon-build.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neon-build
+          path: neon-build.tar.zst
+          retention-days: 3
+          compression-level: 0
+
+  test:
+    name: test ${{ inputs.pg_version || 'v18' }} (shard ${{ matrix.shard }})
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/neondatabase/build-tools:pinned-bookworm
+      options: --init --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.build.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the Postgres submodule under test
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # test_pg_regress and test_isolation read their schedules and expected
+          # output straight out of the Postgres source tree.
+          git submodule update --init --depth 1 "vendor/postgres-${PG_VERSION}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: neon-build
+
+      - name: Unpack the build
+        run: |
+          set -eux
+          zstd -d -c neon-build.tar.zst | tar -xf -
+          chmod +x target/debug/*
+
+      - name: Install the Python test dependencies
+        run: |
+          set -eux
+          ./scripts/pysync
+
+      - name: Run the regression suite
+        env:
+          NEON_BIN: ${{ github.workspace }}/target/debug
+          POSTGRES_DISTRIB_DIR: ${{ github.workspace }}/pg_install
+          TEST_OUTPUT: ${{ github.workspace }}/test_output
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards || '6' }}
+        run: |
+          set -eu
+          # DEFAULT_PG_VERSION wants the bare major number, PG_VERSION is v-prefixed.
+          export DEFAULT_PG_VERSION="${PG_VERSION#v}"
+          export LD_LIBRARY_PATH="${POSTGRES_DISTRIB_DIR}/${PG_VERSION}/lib"
+          mkdir -p "$TEST_OUTPUT"
+          # Deterministic round-robin over the test files, so a shard always
+          # covers the same set and a failure is reproducible by re-running
+          # that shard alone.
+          mapfile -t FILES < <(printf '%s\n' test_runner/regress/test_*.py | sort | awk "NR % $SHARDS == $SHARD % $SHARDS")
+          echo "shard $SHARD/$SHARDS covers ${#FILES[@]} files"
+          printf '  %s\n' "${FILES[@]}"
+          # --timeout: a test that needs longer than this is a finding in itself,
+          # and waiting on it just idles a worker.
+          ./scripts/pytest \
+            -v -rf \
+            -p no:cacheprovider \
+            -n "$(nproc)" --dist=loadgroup \
+            --timeout=600 \
+            --junit-xml="${TEST_OUTPUT}/junit-shard-${SHARD}.xml" \
+            "${FILES[@]}"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-shard-${{ matrix.shard }}
+          path: |
+            test_output/junit-*.xml
+          retention-days: 14
+          if-no-files-found: warn
+
+  report:
+    name: report
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-results-shard-*
+          merge-multiple: true
+          path: results
+
+      - name: Summarise
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          tot = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+          bad = []
+          for fn in sorted(glob.glob("results/**/junit-*.xml", recursive=True)):
+              root = ET.parse(fn).getroot()
+              ts = root if root.tag == "testsuite" else root[0]
+              for tc in ts:
+                  kinds = [c.tag for c in tc]
+                  if "failure" in kinds:
+                      tot["failed"] += 1; bad.append(("FAIL", tc.get("name", "")))
+                  elif "error" in kinds:
+                      tot["error"] += 1; bad.append(("ERROR", tc.get("name", "")))
+                  elif "skipped" in kinds:
+                      tot["skipped"] += 1
+                  else:
+                      tot["passed"] += 1
+          print("## Test results\n")
+          print("| result | count |\n|---|---|")
+          for k, v in tot.items():
+              print(f"| {k} | {v} |")
+          if bad:
+              print(f"\n### Failures ({len(bad)})\n")
+              for kind, name in bad[:100]:
+                  print(f"- `{kind}` {name}")
+              if len(bad) > 100:
+                  print(f"\n...and {len(bad) - 100} more.")
+          PY
+
+      - name: Fail if any test failed
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          bad = 0
+          for fn in glob.glob("results/**/junit-*.xml", recursive=True):
+              root = ET.parse(fn).getroot()
+              ts = root if root.tag == "testsuite" else root[0]
+              bad += sum(1 for tc in ts for c in tc if c.tag in ("failure", "error"))
+          print(f"{bad} failing tests")
+          sys.exit(1 if bad else 0)
+          PY
