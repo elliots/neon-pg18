@@ -30,6 +30,10 @@
 #include "access/xlogutils.h"
 #endif
 
+#if PG_MAJORVERSION_NUM >= 18
+#include "storage/aio.h"
+#endif
+
 #include "inmem_smgr.h"
 
 /* Size of the in-memory smgr: XLR_MAX_BLOCK_ID is 32, so assume that 64 will be enough */
@@ -91,6 +95,10 @@ static void inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blockn
 					   void *buffer);
 static void inmem_write(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, const void *buffer, bool skipFsync);
+#endif
+#if PG_MAJORVERSION_NUM >= 17
+static void inmem_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
+						void **buffers, BlockNumber nblocks);
 #endif
 static void inmem_writeback(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber blocknum, BlockNumber nblocks);
@@ -250,7 +258,7 @@ inmem_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 {
 	for (int i = 0; i < nblocks; i++)
 	{
-		inmem_read(reln, forknum, blkno, buffers[i]);
+		inmem_read(reln, forknum, blkno + i, buffers[i]);
 	}
 }
 #endif
@@ -314,7 +322,7 @@ inmem_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 {
 	for (int i = 0; i < nblocks; i++)
 	{
-		inmem_write(reln, forknum, blkno, buffers[i], skipFsync);
+		inmem_write(reln, forknum, blkno + i, buffers[i], skipFsync);
 	}
 }
 #endif
@@ -361,8 +369,60 @@ inmem_registersync(SMgrRelation reln, ForkNumber forknum)
 }
 #endif
 
+#if PG_MAJORVERSION_NUM >= 18
+/* The WAL redo process only ever runs the inmem smgr, so it claims everything. */
+static bool
+inmem_owns(RelFileLocator rlocator, ProcNumber backend, char relpersistence)
+{
+	return true;
+}
+
+/* Reads are served one block at a time from the page array; never combine. */
+static uint32
+inmem_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+{
+	return 1;
+}
+
+static int
+inmem_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+{
+	elog(ERROR, "inmem_fd() is not supported: the WAL redo smgr has no backing file");
+	return -1;					/* keep the compiler quiet */
+}
+
+/*
+ * PG18 reads exclusively through smgrstartreadv(). Our pages live in a plain
+ * in-memory array, so there is no file descriptor to start a real I/O against.
+ * Copy the pages out and then hand the already-complete I/O back to the AIO
+ * machinery, so the buffer-manager completion callbacks run as usual.
+ */
+static void
+inmem_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
+				 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
+{
+	pgaio_io_set_flag(ioh, PGAIO_HF_SYNCHRONOUS);
+
+	pgaio_io_set_target_smgr(ioh,
+							 reln,
+							 forknum,
+							 blocknum,
+							 nblocks,
+							 false);
+	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
+
+	inmem_readv(reln, forknum, blocknum, buffers, nblocks);
+
+	pgaio_io_complete_synchronously(ioh, PGAIO_OP_READV,
+									(int) nblocks * BLCKSZ);
+}
+#endif							/* PG_MAJORVERSION_NUM >= 18 */
+
 static const struct f_smgr inmem_smgr =
 {
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_name = "inmem",
+#endif
 	.smgr_init = inmem_init,
 	.smgr_shutdown = NULL,
 	.smgr_open = inmem_open,
@@ -374,7 +434,13 @@ static const struct f_smgr inmem_smgr =
 #if PG_MAJORVERSION_NUM >= 16
 	.smgr_zeroextend = inmem_zeroextend,
 #endif
-#if PG_MAJORVERSION_NUM >= 17
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_prefetch = inmem_prefetch,
+	.smgr_maxcombine = inmem_maxcombine,
+	.smgr_readv = inmem_readv,
+	.smgr_startreadv = inmem_startreadv,
+	.smgr_writev = inmem_writev,
+#elif PG_MAJORVERSION_NUM >= 17
 	.smgr_prefetch = inmem_prefetch,
 	.smgr_readv = inmem_readv,
 	.smgr_writev = inmem_writev,
@@ -392,12 +458,28 @@ static const struct f_smgr inmem_smgr =
 	.smgr_registersync = inmem_registersync,
 #endif
 
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_fd = inmem_fd,
+	.smgr_owns = inmem_owns,
+#else
 	.smgr_start_unlogged_build = NULL,
 	.smgr_finish_unlogged_build_phase_1 = NULL,
 	.smgr_end_unlogged_build = NULL,
 	.smgr_read_slru_segment = NULL,
+#endif
 };
 
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * v18 registers storage managers instead of installing an smgr_hook.
+ * Registering after md means our smgr_owns() is consulted first.
+ */
+void
+smgr_register_inmem(void)
+{
+	(void) smgrregister(&inmem_smgr);
+}
+#else
 const f_smgr *
 smgr_inmem(ProcNumber backend, NRelFileInfo rinfo)
 {
@@ -408,6 +490,7 @@ smgr_inmem(ProcNumber backend, NRelFileInfo rinfo)
 	// else
 	return &inmem_smgr;
 }
+#endif
 
 void
 smgr_init_inmem()

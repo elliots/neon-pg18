@@ -171,8 +171,28 @@ extern void InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags);
 extern TimeLineID GetWALInsertionTimeLine(void);
 #endif
 
-/* format codes not present in PG17-; but available in PG18+ */
+/*
+ * Hexadecimal printf format codes for 64-bit integers. Core PostgreSQL does not
+ * define these in any supported version, so we always define them ourselves.
+ *
+ * PG18 removed INT64_MODIFIER in favour of the standard <inttypes.h> length
+ * modifiers, so the spelling differs by version. (c.h pulls in <inttypes.h> on
+ * PG18, so PRIx64 is available here.)
+ */
+#ifndef INT64_HEX_FORMAT
+#if PG_MAJORVERSION_NUM >= 18
+#define INT64_HEX_FORMAT "%" PRIx64
+#else
 #define INT64_HEX_FORMAT "%" INT64_MODIFIER "x"
+#endif
+#endif
+
+#ifndef UINT64_HEX_FORMAT
+#if PG_MAJORVERSION_NUM >= 18
+#define UINT64_HEX_FORMAT "%" PRIx64
+#else
 #define UINT64_HEX_FORMAT "%" INT64_MODIFIER "x"
+#endif
+#endif
 
 #endif							/* NEON_PGVERSIONCOMPAT_H */

@@ -9,6 +9,9 @@ pub const BKPIMAGE_IS_COMPRESSED: u8 = 0x02; /* page image is compressed */
 pub const BKPIMAGE_APPLY: u8 = 0x04; /* page image should be restored during replay */
 pub const SIZEOF_RELMAPFILE: usize = 512; /* sizeof(RelMapFile) in relmapper.c */
 
+/// sizeof(xl_xact_stats_item) in src/include/access/xact.h.
+pub const SIZEOF_XL_XACT_STATS_ITEM: usize = 12;
+
 // List of subdirectories inside pgdata.
 // Copied from src/bin/initdb/initdb.c
 pub const PGDATA_SUBDIRS: [&str; 22] = [

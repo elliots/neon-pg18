@@ -406,7 +406,18 @@ DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 }
 #endif
 
-#if PG_MAJORVERSION_NUM == 17
+#if PG_MAJORVERSION_NUM >= 17
+
+/*
+ * v18 renamed these two reorderbuffer helpers; the signatures are unchanged.
+ */
+#if PG_MAJORVERSION_NUM >= 18
+#define ReorderBufferGetTupleBuf(rb, len)	ReorderBufferAllocTupleBuf(rb, len)
+#define ReorderBufferReturnTupleBuf(tuple)	ReorderBufferFreeTupleBuf(tuple)
+#define ReorderBufferGetChange(rb)			ReorderBufferAllocChange(rb)
+#define ReorderBufferReturnChange(rb, c, u)	ReorderBufferFreeChange(rb, c, u)
+#endif
+
 
 /* individual record(group)'s handlers */
 static void DecodeNeonInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);

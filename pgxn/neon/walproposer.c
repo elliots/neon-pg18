@@ -39,6 +39,7 @@
 
 #include "postgres.h"
 #include "libpq/pqformat.h"
+#include "storage/latch.h"
 #include "neon.h"
 #include "walproposer.h"
 #include "neon_utils.h"

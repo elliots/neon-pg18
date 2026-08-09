@@ -1022,15 +1022,67 @@ impl WalIngest {
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
         let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
 
-        modification.put_slru_wal_record(
-            SlruKind::MultiXactOffsets,
-            segno,
-            rpageno,
-            NeonWalRecord::MultixactOffsetCreate {
-                mid: xlrec.mid,
-                moff: xlrec.moff,
-            },
-        )?;
+        // v18's RecordNewMultiXact() stores the next multixact's offset as well as this
+        // one's, so that the last multixact's member count can be derived from the SLRU
+        // alone. Earlier versions store only this multixact's own offset.
+        let next_entry = if modification.tline.pg_version >= PgMajorVersion::PG18 {
+            let mut next_mid = xlrec.mid.wrapping_add(1);
+            if next_mid < pg_constants::FIRST_MULTIXACT_ID {
+                next_mid = pg_constants::FIRST_MULTIXACT_ID;
+            }
+            // As in GetNewMultiXactId(), offset 0 is skipped.
+            let mut next_moff = xlrec.moff.wrapping_add(xlrec.nmembers);
+            if next_moff == 0 {
+                next_moff = 1;
+            }
+            Some((next_mid, next_moff))
+        } else {
+            None
+        };
+
+        match next_entry {
+            // Both entries live on this page: write them with one record, since two
+            // records for one key at one LSN are "written twice at same LSN".
+            Some((next_mid, next_moff))
+                if next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32 == pageno =>
+            {
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreatePair {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                        next_moff,
+                    },
+                )?;
+            }
+            _ => {
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreate {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                    },
+                )?;
+                // The next entry starts a new page.
+                if let Some((next_mid, next_moff)) = next_entry {
+                    let next_pageno =
+                        next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+                    modification.put_slru_wal_record(
+                        SlruKind::MultiXactOffsets,
+                        next_pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
+                        next_pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
+                        NeonWalRecord::MultixactOffsetCreate {
+                            mid: next_mid,
+                            moff: next_moff,
+                        },
+                    )?;
+                }
+            }
+        }
 
         // Create WAL records for the update of each affected multixact-members page
         let mut members = xlrec.members.iter();
@@ -1206,17 +1258,37 @@ impl WalIngest {
         let RawXlogRecord { info, lsn, mut buf } = raw_record;
         let pg_version = modification.tline.pg_version;
 
+        // wal_level only exists in the checkpoint from v17 on. xl_parameter_change
+        // and xl_end_of_recovery are laid out identically in v17 and v18, so the
+        // v17 decoders serve both; without the V18 arm a v18 timeline would keep a
+        // stale wal_level in the checkpoint it hands to basebackup.
         if info == pg_constants::XLOG_PARAMETER_CHANGE {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlParameterChange::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    let rec = v17::XlParameterChange::decode(&mut buf);
+                    cp.wal_level = rec.wal_level;
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    let rec = v17::XlParameterChange::decode(&mut buf);
+                    cp.wal_level = rec.wal_level;
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         } else if info == pg_constants::XLOG_END_OF_RECOVERY {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlEndOfRecovery::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    let rec = v17::XlEndOfRecovery::decode(&mut buf);
+                    cp.wal_level = rec.wal_level;
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    let rec = v17::XlEndOfRecovery::decode(&mut buf);
+                    cp.wal_level = rec.wal_level;
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         }
 
@@ -1481,7 +1553,7 @@ impl WalIngest {
                 use utils::rate_limit::RateLimit;
 
                 struct RateLimitPerPgVersion {
-                    rate_limiters: [Lazy<Mutex<RateLimit>>; 4],
+                    rate_limiters: [Lazy<Mutex<RateLimit>>; 5],
                 }
 
                 impl RateLimitPerPgVersion {
@@ -1489,7 +1561,7 @@ impl WalIngest {
                         Self {
                             rate_limiters: [const {
                                 Lazy::new(|| Mutex::new(RateLimit::new(Duration::from_secs(30))))
-                            }; 4],
+                            }; 5],
                         }
                     }
 
@@ -1498,7 +1570,7 @@ impl WalIngest {
                         pg_version: PgMajorVersion,
                     ) -> Option<&Lazy<Mutex<RateLimit>>> {
                         const MIN_PG_VERSION: u32 = PgMajorVersion::PG14.major_version_num();
-                        const MAX_PG_VERSION: u32 = PgMajorVersion::PG17.major_version_num();
+                        const MAX_PG_VERSION: u32 = PgMajorVersion::PG18.major_version_num();
                         let pg_version = pg_version.major_version_num();
 
                         if pg_version < MIN_PG_VERSION || pg_version > MAX_PG_VERSION {

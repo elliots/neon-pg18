@@ -203,6 +203,15 @@ jobs:
           sub_fetch_depth: "50"
           pass_if_unchanged: true
 
+      - name: Check vendor/postgres-v18 submodule reference
+        if: steps.check-if-submodules-changed.outputs.vendor == 'true'
+        uses: jtmullen/submodule-branch-check-action@ab0d3a69278e3fa0a2d4f3be3199d2514b676e13 # v1.3.0
+        with:
+          path: "vendor/postgres-v18"
+          fetch_depth: "50"
+          sub_fetch_depth: "50"
+          pass_if_unchanged: true
+
   check-codestyle-rust:
     needs: [ meta, check-permissions, build-build-tools-image ]
     # No need to run on `main` because we this in the merge queue. We do need to run this in `.*-rc-pr` because of hotfixes.
@@ -248,7 +257,9 @@ jobs:
                                                 {"pg_version":"v15", "lfc_state": "with-lfc"},
                                                 {"pg_version":"v16", "lfc_state": "with-lfc"},
                                                 {"pg_version":"v17", "lfc_state": "with-lfc"},
-                                                {"pg_version":"v17", "lfc_state": "without-lfc"}]'
+                                                {"pg_version":"v17", "lfc_state": "without-lfc"},
+                                                {"pg_version":"v18", "lfc_state": "with-lfc"},
+                                                {"pg_version":"v18", "lfc_state": "without-lfc"}]'
                                            || '[{"pg_version":"v17", "lfc_state": "without-lfc" }]' }}
     secrets: inherit
 
@@ -698,6 +709,8 @@ jobs:
             debian: bullseye
           - pg: v17
             debian: bookworm
+          - pg: v18
+            debian: bookworm
         arch: [ x64, arm64 ]
 
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}"]', matrix.arch == 'arm64' && 'large-arm64' || 'large')) }}
@@ -803,6 +816,8 @@ jobs:
             debian: bullseye
           - pg: v17
             debian: bookworm
+          - pg: v18
+            debian: bookworm
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -850,6 +865,8 @@ jobs:
           - pg: v16
             debian: bullseye
           - pg: v17
+            debian: bookworm
+          - pg: v18
             debian: bookworm
     env:
       VM_BUILDER_VERSION: v0.46.0
@@ -907,6 +924,7 @@ jobs:
           - pg: v15
           - pg: v16
           - pg: v17
+          - pg: v18
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
@@ -939,7 +957,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [ x64, arm64 ]
-        pg_version: [v16, v17]
+        pg_version: [v16, v17, v18]
 
     permissions:
       packages: read
@@ -1170,6 +1188,9 @@ jobs:
           ],
           "ghcr.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.build-tag }}": [
             "docker.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.build-tag }}"
+          ],
+          "ghcr.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.build-tag }}": [
+            "docker.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.build-tag }}"
           ]
         }
     secrets: inherit
@@ -1191,6 +1212,10 @@ jobs:
           "ghcr.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.build-tag }}": [
             "docker.io/neondatabase/neon-test-extensions-v17:latest",
             "ghcr.io/neondatabase/neon-test-extensions-v17:latest"
+          ],
+          "ghcr.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.build-tag }}": [
+            "docker.io/neondatabase/neon-test-extensions-v18:latest",
+            "ghcr.io/neondatabase/neon-test-extensions-v18:latest"
           ]
         }
     secrets: inherit
@@ -1212,6 +1237,10 @@ jobs:
           "ghcr.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.release-pr-run-id }}": [
             "docker.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.build-tag }}",
             "ghcr.io/neondatabase/neon-test-extensions-v17:${{ needs.meta.outputs.build-tag }}"
+          ],
+          "ghcr.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.release-pr-run-id }}": [
+            "docker.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.build-tag }}",
+            "ghcr.io/neondatabase/neon-test-extensions-v18:${{ needs.meta.outputs.build-tag }}"
           ]
         }
     secrets: inherit
@@ -1556,7 +1585,7 @@ jobs:
 
               files_to_promote+=("s3://${BUCKET}/${s3_key}")
 
-              for pg_version in v14 v15 v16 v17; do
+              for pg_version in v14 v15 v16 v17 v18; do
                 # We run less tests for debug builds, so we don't need to promote them
                 if [ "${build_type}" == "debug" ] && { [ "${arch}" == "ARM64" ] || [ "${pg_version}" != "v17" ] ; }; then
                   continue

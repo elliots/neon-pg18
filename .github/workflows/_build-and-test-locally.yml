@@ -106,6 +106,10 @@ jobs:
         id: pg_v17_rev
         run: echo pg_rev=$(git rev-parse HEAD:vendor/postgres-v17) >> $GITHUB_OUTPUT
 
+      - name: Set pg 18 revision for caching
+        id: pg_v18_rev
+        run: echo pg_rev=$(git rev-parse HEAD:vendor/postgres-v18) >> $GITHUB_OUTPUT
+
       # Set some environment variables used by all the steps.
       #
       # CARGO_FLAGS is extra options to pass to all "cargo" subcommands.
@@ -191,6 +195,18 @@ jobs:
           use-fallback: false
           path: pg_install/v17
           key: v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build-type }}-pg-${{ steps.pg_v17_rev.outputs.pg_rev }}-bookworm-${{ hashFiles('Makefile', 'build-tools/Dockerfile') }}
+
+      - name: Cache postgres v18 build
+        id: cache_pg_18
+        uses: tespkg/actions-cache@b7bf5fcc2f98a52ac6080eb0fd282c2f752074b1  # v1.8.0
+        with:
+          endpoint: ${{ vars.HETZNER_CACHE_REGION }}.${{ vars.HETZNER_CACHE_ENDPOINT }}
+          bucket: ${{ vars.HETZNER_CACHE_BUCKET }}
+          accessKey: ${{ secrets.HETZNER_CACHE_ACCESS_KEY }}
+          secretKey: ${{ secrets.HETZNER_CACHE_SECRET_KEY }}
+          use-fallback: false
+          path: pg_install/v18
+          key: v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.build-type }}-pg-${{ steps.pg_v18_rev.outputs.pg_rev }}-bookworm-${{ hashFiles('Makefile', 'build-tools/Dockerfile') }}
 
       - name: Build all
         # Note: the Makefile picks up BUILD_TYPE and CARGO_PROFILE from the env variables

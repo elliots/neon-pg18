@@ -35,10 +35,35 @@ pub fn get_lsn_from_controlfile(path: &Utf8Path) -> Result<Lsn> {
     let controlfile_path = path.join("global").join("pg_control");
     let controlfile_buf = std::fs::read(&controlfile_path)
         .with_context(|| format!("reading controlfile: {controlfile_path}"))?;
-    let controlfile = ControlFileData::decode(&controlfile_buf)?;
+    let controlfile = postgres_ffi::decode_control_file(&controlfile_buf)?;
     let lsn = controlfile.checkPoint;
 
     Ok(Lsn(lsn))
+}
+
+/// Refuse a cluster that was initdb'd with data page checksums.
+///
+/// The pageserver does not store pages verbatim: it reconstructs them from WAL,
+/// and synthesizes some outright (the zero-filled gap blocks of a relation
+/// extension, the relations of a FILE_COPY CREATE DATABASE). Nothing computes a
+/// checksum for those, so a compute running against an imported checksummed
+/// cluster fails its first read of one with "invalid page in block N".
+///
+/// This never rejected anything before v18, where initdb's default flipped to
+/// checksums on -- which makes a basebackup of a stock cluster unimportable. Say
+/// so here, rather than at whichever read happens to touch a synthesized page
+/// first. Neon's own clusters are unaffected: postgres_initdb passes
+/// --no-data-checksums on v18+.
+pub(crate) fn ensure_no_data_checksums(pg_control: &ControlFileData) -> Result<()> {
+    ensure!(
+        pg_control.data_checksum_version == 0,
+        "cluster has data page checksums enabled (data_checksum_version={}), \
+         which Neon cannot serve. Re-run initdb with --no-data-checksums, or \
+         run `pg_checksums --disable` against the stopped cluster, and take a \
+         fresh backup.",
+        pg_control.data_checksum_version
+    );
+    Ok(())
 }
 
 ///
@@ -528,7 +553,8 @@ async fn import_file(
                 let bytes = read_all_bytes(reader).await?;
 
                 // Extract the checkpoint record and import it separately.
-                let pg_control = ControlFileData::decode(&bytes[..])?;
+                let pg_control = postgres_ffi::decode_control_file(&bytes[..])?;
+                ensure_no_data_checksums(&pg_control)?;
                 let checkpoint_bytes = pg_control.checkPointCopy.encode()?;
                 modification.put_checkpoint(checkpoint_bytes)?;
                 debug!("imported control file");

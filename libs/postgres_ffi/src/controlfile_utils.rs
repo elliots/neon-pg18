@@ -34,7 +34,7 @@ const SIZEOF_CONTROLDATA: usize = size_of::<ControlFileData>();
 impl ControlFileData {
     /// Compute the offset of the `crc` field within the `ControlFileData` struct.
     /// Equivalent to offsetof(ControlFileData, crc) in C.
-    const fn pg_control_crc_offset() -> usize {
+    pub const fn pg_control_crc_offset() -> usize {
         std::mem::offset_of!(ControlFileData, crc)
     }
 
@@ -42,6 +42,21 @@ impl ControlFileData {
     /// Interpret a slice of bytes as a Postgres control file.
     ///
     pub fn decode(buf: &[u8]) -> Result<ControlFileData> {
+        Self::decode_with_crc_offset(buf, Self::pg_control_crc_offset())
+    }
+
+    ///
+    /// Interpret a slice of bytes as a Postgres control file, taking the offset
+    /// of the `crc` field from the caller.
+    ///
+    /// The position of `crc` is version-dependent: PostgreSQL 18 inserted a
+    /// `default_char_signedness` field ahead of `mock_authentication_nonce`,
+    /// which moved `crc` from offset 288 to 292. Code that reads a control file
+    /// belonging to a possibly-different major version should go through
+    /// [`crate::decode_control_file`], which picks the offset based on the
+    /// `pg_control_version` recorded in the file itself.
+    ///
+    pub fn decode_with_crc_offset(buf: &[u8], offsetof_crc: usize) -> Result<ControlFileData> {
         use utils::bin_ser::LeSer;
 
         // Check that the slice has the expected size. The control file is
@@ -51,22 +66,37 @@ impl ControlFileData {
         if buf.len() < SIZEOF_CONTROLDATA {
             bail!("control file is too short");
         }
+        if offsetof_crc + size_of::<u32>() > buf.len() {
+            bail!("control file is too short to contain a CRC at offset {offsetof_crc}");
+        }
 
         // Compute the expected CRC of the content.
-        let OFFSETOF_CRC = Self::pg_control_crc_offset();
-        let expectedcrc = crc32c::crc32c(&buf[0..OFFSETOF_CRC]);
+        let expectedcrc = crc32c::crc32c(&buf[0..offsetof_crc]);
 
-        // Use serde to deserialize the input as a ControlFileData struct.
-        let controlfile = ControlFileData::des_prefix(buf)?;
+        // Read the stored CRC straight from the buffer rather than from the
+        // deserialized struct, since the struct layout might belong to a
+        // different major version than the file.
+        let actualcrc = u32::from_ne_bytes(
+            buf[offsetof_crc..offsetof_crc + size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        );
 
         // Check the CRC
-        if expectedcrc != controlfile.crc {
+        if expectedcrc != actualcrc {
             bail!(
                 "invalid CRC in control file: expected {:08X}, was {:08X}",
                 expectedcrc,
-                controlfile.crc
+                actualcrc
             );
         }
+
+        // Use serde to deserialize the input as a ControlFileData struct.
+        let mut controlfile = ControlFileData::des_prefix(buf)?;
+
+        // Make sure the returned struct reports the CRC we actually validated,
+        // even if this struct's layout puts `crc` somewhere else.
+        controlfile.crc = actualcrc;
 
         Ok(controlfile)
     }

@@ -29,7 +29,6 @@ use pageserver::tenant::metadata::TimelineMetadata;
 use pageserver::virtual_file::api::IoMode;
 use pageserver::virtual_file::{self};
 use pageserver_api::shard::TenantShardId;
-use postgres_ffi::ControlFileData;
 use remote_storage::{RemotePath, RemoteStorageConfig};
 use tokio_util::sync::CancellationToken;
 use utils::id::TimelineId;
@@ -196,7 +195,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn read_pg_control_file(control_file_path: &Utf8Path) -> anyhow::Result<()> {
-    let control_file = ControlFileData::decode(&std::fs::read(control_file_path)?)?;
+    // decode() assumes the v14 layout, whose crc offset (288) is wrong for v18
+    // (292, after default_char_signedness was added). decode_control_file() reads
+    // pg_control_version first and validates the crc at the right place.
+    let control_file = postgres_ffi::decode_control_file(&std::fs::read(control_file_path)?)?;
     println!("{control_file:?}");
     let control_file_initdb = Lsn(control_file.checkPoint);
     println!(

@@ -19,6 +19,7 @@
 #include "utils/wait_event.h"
 #include "utils/guc.h"
 #include "postmaster/interrupt.h"
+#include "storage/latch.h"
 
 #include "neon.h"
 #include "neon_walreader.h"

@@ -3,7 +3,7 @@
 # different images for each PostgreSQL major version.
 #
 # We use Debian as the base for all the steps. The production images use Debian bookworm
-# for v17, and Debian bullseye for older PostgreSQL versions.
+# for v17 and v18, and Debian bullseye for older PostgreSQL versions.
 #
 # ## Intermediary layers
 #
@@ -136,7 +136,7 @@ RUN case $DEBIAN_VERSION in \
         echo "deb http://archive.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/bullseye-backports.list; \
         VERSION_INSTALLS="cmake/bullseye-backports cmake-data/bullseye-backports libstdc++-10-dev"; \
       ;; \
-      # Version-specific installs for Bookworm (PG17):
+      # Version-specific installs for Bookworm (PG17, PG18):
       bookworm) \
         VERSION_INSTALLS="cmake libstdc++-12-dev"; \
       ;; \
@@ -185,7 +185,7 @@ RUN cd postgres && \
     "v14" | "v15" | "v16") \
     patch -p1 < /pg_stat_statements_pg14-16.patch; \
     ;; \
-    "v17") \
+    "v17" | "v18") \
     patch -p1 < /pg_stat_statements_pg17.patch; \
     ;; \
     *) \
@@ -261,6 +261,10 @@ RUN case "${PG_VERSION:?}" in \
     "v17") \
         export POSTGIS_VERSION=3.5.0 \
         export POSTGIS_CHECKSUM=ca698a22cc2b2b3467ac4e063b43a28413f3004ddd505bdccdd74c56a647f510 \
+    ;; \
+    "v18") \
+        export POSTGIS_VERSION=3.6.0 \
+        export POSTGIS_CHECKSUM=8caffef4b457ed70d5328bf4e5a21f9306b06c271662e03e1a65d30090e5f25f \
     ;; \
     "v14" | "v15" | "v16") \
         export POSTGIS_VERSION=3.3.3 \
@@ -338,6 +342,10 @@ RUN case "${PG_VERSION:?}" in \
         export PGROUTING_VERSION=3.6.2 \
         export PGROUTING_CHECKSUM=f4a1ed79d6f714e52548eca3bb8e5593c6745f1bde92eb5fb858efd8984dffa2 \
     ;; \
+    "v18") \
+        export PGROUTING_VERSION=3.8.0 \
+        export PGROUTING_CHECKSUM=b8a5f0472934fdf7cda3fb4754d01945378d920cdaddc01f378617ddbb9c447f \
+    ;; \
     "v14" | "v15" | "v16") \
         export PGROUTING_VERSION=3.4.2 \
         export PGROUTING_CHECKSUM=cac297c07d34460887c4f3b522b35c470138760fe358e351ad1db4edb6ee306e \
@@ -386,6 +394,9 @@ RUN case "${PG_VERSION:?}" in \
     "v14" | "v15" | "v16") \
         export PLV8_TAG=v3.1.10 \
     ;; \
+    "v18") \
+        echo "plv8 is deprecated and not built for PostgreSQL 18, skipping" && exit 0 \
+    ;; \
     *) \
         echo "unexpected PostgreSQL version" && exit 1 \
     ;; \
@@ -406,12 +417,14 @@ RUN apt update && \
     ninja-build python3-dev libncurses5 binutils clang \
     && apt clean && rm -rf /var/lib/apt/lists/*
 COPY --from=plv8-src /ext-src/ /ext-src/
-RUN make DOCKER=1 -j $(getconf _NPROCESSORS_ONLN) v8
+# plv8-src produces nothing on the versions where plv8 is skipped (v18).
+RUN if [ -f Makefile ]; then make DOCKER=1 -j $(getconf _NPROCESSORS_ONLN) v8; fi
 
 # Step 2: Build the PostgreSQL-dependent parts
 COPY --from=pg-build /usr/local/pgsql /usr/local/pgsql
 ENV PATH="/usr/local/pgsql/bin:$PATH"
 RUN \
+    if [ ! -f Makefile ]; then exit 0; fi; \
     # generate and copy upgrade scripts
     make generate_upgrades && \
     cp upgrade/* /usr/local/pgsql/share/extension/ && \
@@ -445,18 +458,39 @@ FROM build-deps AS h3-pg-src
 ARG PG_VERSION
 WORKDIR /ext-src
 
-# not version-specific
-# last release v4.1.0 - Jan 18, 2023
-RUN mkdir -p /h3/usr/ && \
-    wget https://github.com/uber/h3/archive/refs/tags/v4.1.0.tar.gz -O h3.tar.gz && \
-    echo "ec99f1f5974846bde64f4513cf8d2ea1b8d172d2218ab41803bf6a63532272bc h3.tar.gz" | sha256sum --check && \
+# h3-pg pins the core library version it builds against (H3_CORE_VERSION in its
+# CMakeLists.txt): 4.1.3 wants 4.1.0, 4.2.3 wants 4.2.0.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export H3_VERSION=4.2.0 \
+        export H3_CHECKSUM=438db46fc2b388785d2a0d8e26aa5509739240a7b50b2510c416778d871a4e11 \
+    ;; \
+    *) \
+        export H3_VERSION=4.1.0 \
+        export H3_CHECKSUM=ec99f1f5974846bde64f4513cf8d2ea1b8d172d2218ab41803bf6a63532272bc \
+    ;; \
+    esac && \
+    mkdir -p /h3/usr/ && \
+    wget https://github.com/uber/h3/archive/refs/tags/v${H3_VERSION}.tar.gz -O h3.tar.gz && \
+    echo "${H3_CHECKSUM} h3.tar.gz" | sha256sum --check && \
     mkdir h3-src && cd h3-src && tar xzf ../h3.tar.gz --strip-components=1 -C .
 
-# not version-specific
-# last release v4.1.3 - Jul 26, 2023
+# The project moved from zachasme/h3-pg to postgis/h3-pg; the tags went with it
+# and the old URL now 404s for every version. Contents are identical, so the
+# v4.1.3 checksum is unchanged.
 WORKDIR /ext-src
-RUN wget https://github.com/zachasme/h3-pg/archive/refs/tags/v4.1.3.tar.gz -O h3-pg.tar.gz && \
-    echo "5c17f09a820859ffe949f847bebf1be98511fb8f1bd86f94932512c00479e324 h3-pg.tar.gz" | sha256sum --check && \
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export H3_PG_VERSION=4.2.3 \
+        export H3_PG_CHECKSUM=3c420e8ee3324bfeac600cadf3c7a7bc26c3b95e123d48e40459d34dcd714654 \
+    ;; \
+    *) \
+        export H3_PG_VERSION=4.1.3 \
+        export H3_PG_CHECKSUM=5c17f09a820859ffe949f847bebf1be98511fb8f1bd86f94932512c00479e324 \
+    ;; \
+    esac && \
+    wget https://github.com/postgis/h3-pg/archive/refs/tags/v${H3_PG_VERSION}.tar.gz -O h3-pg.tar.gz && \
+    echo "${H3_PG_CHECKSUM} h3-pg.tar.gz" | sha256sum --check && \
     mkdir h3-pg-src && cd h3-pg-src && tar xzf ../h3-pg.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS h3-pg-build
@@ -523,8 +557,20 @@ COPY compute/patches/pgvector.patch .
 #
 # vector >0.7.4 supports v17
 # last release v0.8.0 - Oct 30, 2024
-RUN wget https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz -O pgvector.tar.gz && \
-    echo "867a2c328d4928a5a9d6f052cd3bc78c7d60228a9b914ad32aa3db88e9de27b0 pgvector.tar.gz" | sha256sum --check && \
+# v0.8.0 does not build against v18: vacuum_delay_point() gained an argument.
+# v0.8.1 tracks that. The pgvector.patch below applies to both.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PGVECTOR_VERSION=0.8.1 \
+        export PGVECTOR_CHECKSUM=a9094dfb85ccdde3cbb295f1086d4c71a20db1d26bf1d6c39f07a7d164033eb4 \
+    ;; \
+    *) \
+        export PGVECTOR_VERSION=0.8.0 \
+        export PGVECTOR_CHECKSUM=867a2c328d4928a5a9d6f052cd3bc78c7d60228a9b914ad32aa3db88e9de27b0 \
+    ;; \
+    esac && \
+    wget https://github.com/pgvector/pgvector/archive/refs/tags/v${PGVECTOR_VERSION}.tar.gz -O pgvector.tar.gz && \
+    echo "${PGVECTOR_CHECKSUM} pgvector.tar.gz" | sha256sum --check && \
     mkdir pgvector-src && cd pgvector-src && tar xzf ../pgvector.tar.gz --strip-components=1 -C . && \
     wget https://github.com/pgvector/pgvector/raw/refs/tags/v0.7.4/sql/vector.sql -O ./sql/vector--0.7.4.sql && \
     echo "10218d05dc02299562252a9484775178b14a1d8edb92a2d1672ef488530f7778 ./sql/vector--0.7.4.sql" | sha256sum --check && \
@@ -652,17 +698,23 @@ COPY compute/patches/rum.patch .
 # supports v17 since https://github.com/postgrespro/rum/commit/cb1edffc57736cd2a4455f8d0feab0d69928da25
 # doesn't use releases since 1.3.13 - Sep 19, 2022
 # use latest commit from the master branch
-RUN wget https://github.com/postgrespro/rum/archive/cb1edffc57736cd2a4455f8d0feab0d69928da25.tar.gz -O rum.tar.gz && \
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        echo "rum has no PostgreSQL 18 support yet, skipping" && exit 0; \
+    fi; \
+    wget https://github.com/postgrespro/rum/archive/cb1edffc57736cd2a4455f8d0feab0d69928da25.tar.gz -O rum.tar.gz && \
     echo "65e0a752e99f4c3226400c9b899f997049e93503db8bf5c8072efa136d32fd83 rum.tar.gz" | sha256sum --check && \
     mkdir rum-src && cd rum-src && tar xzf ../rum.tar.gz --strip-components=1 -C . && \
     patch -p1 < /ext-src/rum.patch
 
 FROM pg-build AS rum-build
 COPY --from=rum-src /ext-src/ /ext-src/
-WORKDIR /ext-src/rum-src
-RUN make -j $(getconf _NPROCESSORS_ONLN) USE_PGXS=1 && \
-    make -j $(getconf _NPROCESSORS_ONLN) install USE_PGXS=1 && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/rum.control
+WORKDIR /ext-src/
+RUN if [ -d rum-src ]; then \
+        cd rum-src && \
+        make -j $(getconf _NPROCESSORS_ONLN) USE_PGXS=1 && \
+        make -j $(getconf _NPROCESSORS_ONLN) install USE_PGXS=1 && \
+        echo 'trusted = true' >> /usr/local/pgsql/share/extension/rum.control; \
+    fi
 
 #########################################################################################
 #
@@ -767,9 +819,21 @@ ARG PG_VERSION
 
 # plpgsql_check v2.7.11 supports v17
 # last release v2.7.11 - Sep 16, 2024
+# v2.7.11 does not build against v18: PLpgSQL_func_hashkey is gone and
+# PLpgSQL_function lost its use_count member. v2.8.2 tracks those changes.
 WORKDIR /ext-src
-RUN wget https://github.com/okbob/plpgsql_check/archive/refs/tags/v2.7.11.tar.gz -O plpgsql_check.tar.gz && \
-    echo "208933f8dbe8e0d2628eb3851e9f52e6892b8e280c63700c0f1ce7883625d172 plpgsql_check.tar.gz" | sha256sum --check && \
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PLPGSQL_CHECK_VERSION=2.8.2 \
+        export PLPGSQL_CHECK_CHECKSUM=66cb840ab8b18d06077827e316800a2d92ed483f9bbacbfad6d4a2e8e26f4048 \
+    ;; \
+    *) \
+        export PLPGSQL_CHECK_VERSION=2.7.11 \
+        export PLPGSQL_CHECK_CHECKSUM=208933f8dbe8e0d2628eb3851e9f52e6892b8e280c63700c0f1ce7883625d172 \
+    ;; \
+    esac && \
+    wget https://github.com/okbob/plpgsql_check/archive/refs/tags/v${PLPGSQL_CHECK_VERSION}.tar.gz -O plpgsql_check.tar.gz && \
+    echo "${PLPGSQL_CHECK_CHECKSUM} plpgsql_check.tar.gz" | sha256sum --check && \
     mkdir plpgsql_check-src && cd plpgsql_check-src && tar xzf ../plpgsql_check.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS plpgsql_check-build
@@ -801,6 +865,10 @@ RUN case "${PG_VERSION:?}" in \
       "v17") \
         export TIMESCALEDB_VERSION=2.17.1 \
         export TIMESCALEDB_CHECKSUM=6277cf43f5695e23dae1c5cfeba00474d730b66ed53665a84b787a6bb1a57e28 \
+        ;; \
+      "v18") \
+        export TIMESCALEDB_VERSION=2.23.0 \
+        export TIMESCALEDB_CHECKSUM=f965840ef9ba969b874c5825ca9a1e8cca667783d7c8bab623ffacb8d95b2d68 \
         ;; \
     esac && \
     wget https://github.com/timescale/timescaledb/archive/refs/tags/${TIMESCALEDB_VERSION}.tar.gz -O timescaledb.tar.gz && \
@@ -844,6 +912,10 @@ RUN case "${PG_VERSION:?}" in \
         export PG_HINT_PLAN_VERSION=17_1_7_0 \
         export PG_HINT_PLAN_CHECKSUM=06dd306328c67a4248f48403c50444f30959fb61ebe963248dbc2afb396fe600 \
         ;; \
+      "v18") \
+        export PG_HINT_PLAN_VERSION=18_1_8_0 \
+        export PG_HINT_PLAN_CHECKSUM=c3d8aa1e468b6b8371fb09d971152b9ac1610118fbd0c76c7e308e88a1cc0ef7 \
+        ;; \
       *) \
         echo "Export the valid PG_HINT_PLAN_VERSION variable" && exit 1 \
         ;; \
@@ -874,8 +946,20 @@ ARG PG_VERSION
 # We set it in shared_preload_libraries and computes will fail to start if library is not found.
 WORKDIR /ext-src
 COPY compute/patches/pg_cron.patch .
-RUN wget https://github.com/citusdata/pg_cron/archive/refs/tags/v1.6.4.tar.gz -O pg_cron.tar.gz && \
-    echo "52d1850ee7beb85a4cb7185731ef4e5a90d1de216709d8988324b0d02e76af61 pg_cron.tar.gz" | sha256sum --check && \
+# v1.6.4 does not build against v18: PortalRun() changed signature. v1.6.6 does,
+# and still reports itself as 1.6, which is the version Neon documents for PG18.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_CRON_VERSION=1.6.6 \
+        export PG_CRON_CHECKSUM=e1c17c94cd57771cc6df35c583d7be7131e8efcb938c0ed46ae342518510d610 \
+    ;; \
+    *) \
+        export PG_CRON_VERSION=1.6.4 \
+        export PG_CRON_CHECKSUM=52d1850ee7beb85a4cb7185731ef4e5a90d1de216709d8988324b0d02e76af61 \
+    ;; \
+    esac && \
+    wget https://github.com/citusdata/pg_cron/archive/refs/tags/v${PG_CRON_VERSION}.tar.gz -O pg_cron.tar.gz && \
+    echo "${PG_CRON_CHECKSUM} pg_cron.tar.gz" | sha256sum --check && \
     mkdir pg_cron-src && cd pg_cron-src && tar xzf ../pg_cron.tar.gz --strip-components=1 -C . && \
     patch < /ext-src/pg_cron.patch
 
@@ -908,6 +992,10 @@ RUN case "${PG_VERSION:?}" in \
         export RDKIT_VERSION=Release_2024_09_1 \
         export RDKIT_CHECKSUM=034c00d6e9de323506834da03400761ed8c3721095114369d06805409747a60f \
     ;; \
+    "v18") \
+        export RDKIT_VERSION=Release_2025_09_6 \
+        export RDKIT_CHECKSUM=57b92e8f47d9dbd559bd808d5cf6c48a628bc36118bc35b832a35e2ca8a0c7a1 \
+    ;; \
     "v14" | "v15" | "v16") \
         export RDKIT_VERSION=Release_2023_03_3 \
         export RDKIT_CHECKSUM=bdbf9a2e6988526bfeb8c56ce3cdfe2998d60ac289078e2215374288185e8c8d \
@@ -921,14 +1009,29 @@ RUN case "${PG_VERSION:?}" in \
     mkdir rdkit-src && cd rdkit-src && tar xzf ../rdkit.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS rdkit-build
-RUN apt update && \
-    apt install --no-install-recommends --no-install-suggests -y \
-        libboost-iostreams1.74-dev \
-        libboost-regex1.74-dev \
-        libboost-serialization1.74-dev \
-        libboost-system1.74-dev \
-        libeigen3-dev \
-        libboost-all-dev \
+ARG PG_VERSION
+# rdkit >= Release_2025_03 sets RDK_BOOST_VERSION 1.81.0, and bookworm only ships
+# Boost 1.74, so the v18 build pulls 1.83 from bookworm-backports instead.
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/bookworm-backports.list && \
+        apt update && \
+        apt install --no-install-recommends --no-install-suggests -y -t bookworm-backports \
+            libboost1.83-dev \
+            libboost-iostreams1.83-dev \
+            libboost-regex1.83-dev \
+            libboost-serialization1.83-dev \
+            libboost-system1.83-dev && \
+        apt install --no-install-recommends --no-install-suggests -y libeigen3-dev; \
+    else \
+        apt update && \
+        apt install --no-install-recommends --no-install-suggests -y \
+            libboost-iostreams1.74-dev \
+            libboost-regex1.74-dev \
+            libboost-serialization1.74-dev \
+            libboost-system1.74-dev \
+            libeigen3-dev \
+            libboost-all-dev; \
+    fi \
     && apt clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rdkit-src /ext-src/ /ext-src/
@@ -1035,6 +1138,10 @@ RUN case "${PG_VERSION:?}" in \
         export SEMVER_VERSION=0.40.0 \
         export SEMVER_CHECKSUM=3e50bcc29a0e2e481e7b6d2bc937cadc5f5869f55d983b5a1aafeb49f5425cfc \
     ;; \
+    "v18") \
+        export SEMVER_VERSION=0.41.0 \
+        export SEMVER_CHECKSUM=51e284f68eaa1ac230899254aa2211fffe1dadc45c47f8d114246cb04f4c03f9 \
+    ;; \
     "v14" | "v15" | "v16") \
         export SEMVER_VERSION=0.32.1 \
         export SEMVER_CHECKSUM=fbdaf7512026d62eec03fad8687c15ed509b6ba395bff140acd63d2e4fbe25d7 \
@@ -1102,8 +1209,12 @@ ARG PG_VERSION
 RUN case "${PG_VERSION:?}" in \
         'v17') \
             echo 'v17 is not supported yet by pgrx. Quit' && exit 0;; \
+        'v18') \
+            export PGRX_VERSION=0.16.1;; \
+        *) \
+            export PGRX_VERSION=0.11.3;; \
     esac && \
-    cargo install --locked --version 0.11.3 cargo-pgrx && \
+    cargo install --locked --version ${PGRX_VERSION} cargo-pgrx && \
     /bin/bash -c 'cargo pgrx init --pg${PG_VERSION:1}=/usr/local/pgsql/bin/pg_config'
 
 USER root
@@ -1121,7 +1232,13 @@ USER root
 FROM pg-build-with-cargo AS rust-extensions-build-pgrx12
 ARG PG_VERSION
 
-RUN cargo install --locked --version 0.12.9 cargo-pgrx && \
+RUN case "${PG_VERSION:?}" in \
+        'v18') \
+            export PGRX_VERSION=0.16.1;; \
+        *) \
+            export PGRX_VERSION=0.12.9;; \
+    esac && \
+    cargo install --locked --version ${PGRX_VERSION} cargo-pgrx && \
     /bin/bash -c 'cargo pgrx init --pg${PG_VERSION:1}=/usr/local/pgsql/bin/pg_config'
 
 USER root
@@ -1138,7 +1255,13 @@ USER root
 FROM pg-build-with-cargo AS rust-extensions-build-pgrx14
 ARG PG_VERSION
 
-RUN cargo install --locked --version 0.14.1 cargo-pgrx && \
+RUN case "${PG_VERSION:?}" in \
+        'v18') \
+            export PGRX_VERSION=0.16.1;; \
+        *) \
+            export PGRX_VERSION=0.14.1;; \
+    esac && \
+    cargo install --locked --version ${PGRX_VERSION} cargo-pgrx && \
     /bin/bash -c 'cargo pgrx init --pg${PG_VERSION:1}=/usr/local/pgsql/bin/pg_config'
 
 USER root
@@ -1160,11 +1283,23 @@ RUN wget https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.18.1.tar.
     patch -p1 < /ext-src/onnxruntime.patch && \
     echo "#nothing to test here" > neon-test.sh
 
-RUN wget https://github.com/neondatabase-labs/pgrag/archive/refs/tags/v0.1.2.tar.gz -O pgrag.tar.gz &&  \
-    echo "7361654ea24f08cbb9db13c2ee1c0fe008f6114076401bb871619690dafc5225 pgrag.tar.gz" | sha256sum --check && \
+# On v18 these need the upstream release that moved to pgrx 0.16.1.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PGRAG_VERSION=0.1.4 \
+        export PGRAG_CHECKSUM=a0f3fe53df9f36af04763dbd3fb19031d92010987d7613fd9710c821ffbeefab \
+    ;; \
+    *) \
+        export PGRAG_VERSION=0.1.2 \
+        export PGRAG_CHECKSUM=7361654ea24f08cbb9db13c2ee1c0fe008f6114076401bb871619690dafc5225 \
+    ;; \
+    esac && \
+    wget https://github.com/neondatabase-labs/pgrag/archive/refs/tags/v${PGRAG_VERSION}.tar.gz -O pgrag.tar.gz && \
+    echo "${PGRAG_CHECKSUM} pgrag.tar.gz" | sha256sum --check && \
     mkdir pgrag-src && cd pgrag-src && tar xzf ../pgrag.tar.gz --strip-components=1 -C .
 
 FROM rust-extensions-build-pgrx14 AS pgrag-build
+ARG PG_VERSION
 COPY --from=pgrag-src /ext-src/ /ext-src/
 
 # Install build-time dependencies
@@ -1184,19 +1319,31 @@ RUN . venv/bin/activate && \
 
 WORKDIR /ext-src/pgrag-src
 RUN cd exts/rag && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
+    if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
+        sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
     cargo pgrx install --release && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/rag.control
 
 RUN cd exts/rag_bge_small_en_v15 && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
+    if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
+        sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
     ORT_LIB_LOCATION=/ext-src/onnxruntime-src/build/Linux \
         REMOTE_ONNX_URL=http://pg-ext-s3-gateway.pg-ext-s3-gateway.svc.cluster.local/pgrag-data/bge_small_en_v15.onnx \
         cargo pgrx install --release --features remote_onnx && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/rag_bge_small_en_v15.control
 
 RUN cd exts/rag_jina_reranker_v1_tiny_en && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
+    if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
+        sed -i 's/pgrx = "0.14.1"/pgrx = { version = "0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
     ORT_LIB_LOCATION=/ext-src/onnxruntime-src/build/Linux \
         REMOTE_ONNX_URL=http://pg-ext-s3-gateway.pg-ext-s3-gateway.svc.cluster.local/pgrag-data/jina_reranker_v1_tiny_en.onnx \
         cargo pgrx install --release --features remote_onnx && \
@@ -1214,14 +1361,29 @@ FROM build-deps AS pg_jsonschema-src
 ARG PG_VERSION
 # last release v0.3.3 - Oct 16, 2024
 WORKDIR /ext-src
-RUN wget https://github.com/supabase/pg_jsonschema/archive/refs/tags/v0.3.3.tar.gz -O pg_jsonschema.tar.gz && \
-    echo "40c2cffab4187e0233cb8c3bde013be92218c282f95f4469c5282f6b30d64eac pg_jsonschema.tar.gz" | sha256sum --check && \
+# On v18 these need the upstream release that moved to pgrx 0.16.1.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_JSONSCHEMA_VERSION=0.3.4 \
+        export PG_JSONSCHEMA_CHECKSUM=3bfddb105d71df10078f935a5ac1328660a1a2fe290f2342c2b4a142d4f47d91 \
+    ;; \
+    *) \
+        export PG_JSONSCHEMA_VERSION=0.3.3 \
+        export PG_JSONSCHEMA_CHECKSUM=40c2cffab4187e0233cb8c3bde013be92218c282f95f4469c5282f6b30d64eac \
+    ;; \
+    esac && \
+    wget https://github.com/supabase/pg_jsonschema/archive/refs/tags/v${PG_JSONSCHEMA_VERSION}.tar.gz -O pg_jsonschema.tar.gz && \
+    echo "${PG_JSONSCHEMA_CHECKSUM} pg_jsonschema.tar.gz" | sha256sum --check && \
     mkdir pg_jsonschema-src && cd pg_jsonschema-src && tar xzf ../pg_jsonschema.tar.gz --strip-components=1 -C .
 
 FROM rust-extensions-build-pgrx12 AS pg_jsonschema-build
+ARG PG_VERSION
 COPY --from=pg_jsonschema-src /ext-src/ /ext-src/
 WORKDIR /ext-src/pg_jsonschema-src
-RUN \
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
     # see commit 252b3685a27a0f4c31a0f91e983c6314838e89e8
     # `unsafe-postgres` feature allows to build pgx extensions
     # against postgres forks that decided to change their ABI name (like us).
@@ -1245,8 +1407,19 @@ ARG PG_VERSION
 # last release v1.5.9 - Oct 16, 2024
 WORKDIR /ext-src
 COPY compute/patches/pg_graphql.patch .
-RUN wget https://github.com/supabase/pg_graphql/archive/refs/tags/v1.5.9.tar.gz -O pg_graphql.tar.gz && \
-    echo "cf768385a41278be1333472204fc0328118644ae443182cf52f7b9b23277e497 pg_graphql.tar.gz" | sha256sum --check && \
+# On v18 these need the upstream release that moved to pgrx 0.16.1.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_GRAPHQL_VERSION=1.5.12 \
+        export PG_GRAPHQL_CHECKSUM=bbf9bd0d462666e9caa03d6c031a00b4b990c67cc4b0792c77be23d85c88fd38 \
+    ;; \
+    *) \
+        export PG_GRAPHQL_VERSION=1.5.9 \
+        export PG_GRAPHQL_CHECKSUM=cf768385a41278be1333472204fc0328118644ae443182cf52f7b9b23277e497 \
+    ;; \
+    esac && \
+    wget https://github.com/supabase/pg_graphql/archive/refs/tags/v${PG_GRAPHQL_VERSION}.tar.gz -O pg_graphql.tar.gz && \
+    echo "${PG_GRAPHQL_CHECKSUM} pg_graphql.tar.gz" | sha256sum --check && \
     mkdir pg_graphql-src && cd pg_graphql-src && tar xzf ../pg_graphql.tar.gz --strip-components=1 -C . && \
     sed -i 's/pgrx = "=0.12.6"/pgrx = { version = "0.12.9", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
     sed -i 's/pgrx-tests = "=0.12.6"/pgrx-tests = "=0.12.9"/g' Cargo.toml && \
@@ -1254,9 +1427,14 @@ RUN wget https://github.com/supabase/pg_graphql/archive/refs/tags/v1.5.9.tar.gz 
 
 
 FROM rust-extensions-build-pgrx12 AS pg_graphql-build
+ARG PG_VERSION
 COPY --from=pg_graphql-src /ext-src/ /ext-src/
 WORKDIR /ext-src/pg_graphql-src
-RUN cargo pgrx install --release && \
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
+    cargo pgrx install --release && \
     # it's needed to enable extension because it uses untrusted C language
     sed -i 's/superuser = false/superuser = true/g' /usr/local/pgsql/share/extension/pg_graphql.control && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_graphql.control
@@ -1274,16 +1452,32 @@ ARG PG_VERSION
 # doesn't use releases
 # 9118dd4549b7d8c0bbc98e04322499f7bf2fa6f7 - on Oct 29, 2024
 WORKDIR /ext-src
-RUN wget https://github.com/kelvich/pg_tiktoken/archive/9118dd4549b7d8c0bbc98e04322499f7bf2fa6f7.tar.gz -O pg_tiktoken.tar.gz && \
-    echo "a5bc447e7920ee149d3c064b8b9f0086c0e83939499753178f7d35788416f628 pg_tiktoken.tar.gz" | sha256sum --check && \
+# On v18 these need the upstream release that moved to pgrx 0.16.1.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_TIKTOKEN_VERSION=0baf8d46620c9fa21acf4dc5f167e25f693aa932 \
+        export PG_TIKTOKEN_CHECKSUM=a9c9011bc054209e3251025f5d440dc2a227a39d780ae20e8b1b8364c83cb220 \
+    ;; \
+    *) \
+        export PG_TIKTOKEN_VERSION=9118dd4549b7d8c0bbc98e04322499f7bf2fa6f7 \
+        export PG_TIKTOKEN_CHECKSUM=a5bc447e7920ee149d3c064b8b9f0086c0e83939499753178f7d35788416f628 \
+    ;; \
+    esac && \
+    wget https://github.com/kelvich/pg_tiktoken/archive/${PG_TIKTOKEN_VERSION}.tar.gz -O pg_tiktoken.tar.gz && \
+    echo "${PG_TIKTOKEN_CHECKSUM} pg_tiktoken.tar.gz" | sha256sum --check && \
     mkdir pg_tiktoken-src && cd pg_tiktoken-src && tar xzf ../pg_tiktoken.tar.gz --strip-components=1 -C . && \
     sed -i 's/pgrx = { version = "=0.12.6",/pgrx = { version = "0.12.9",/g' Cargo.toml && \
     sed -i 's/pgrx-tests = "=0.12.6"/pgrx-tests = "0.12.9"/g' Cargo.toml
 
 FROM rust-extensions-build-pgrx12 AS pg_tiktoken-build
+ARG PG_VERSION
 COPY --from=pg_tiktoken-src /ext-src/ /ext-src/
 WORKDIR /ext-src/pg_tiktoken-src
-RUN cargo pgrx install --release && \
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    fi; \
+    cargo pgrx install --release && \
     echo "trusted = true" >> /usr/local/pgsql/share/extension/pg_tiktoken.control
 
 #########################################################################################
@@ -1310,6 +1504,7 @@ RUN case "${PG_VERSION:?}" in \
     sed -i 's/pgrx       = "^0.11.2"/pgrx = { version = "=0.11.3", features = [ "unsafe-postgres" ] }/g' Cargo.toml
 
 FROM rust-extensions-build AS pgx_ulid-build
+ARG PG_VERSION
 COPY --from=pgx_ulid-src /ext-src/ /ext-src/
 WORKDIR /ext-src/
 RUN if [ -d pgx_ulid-src ]; then \
@@ -1331,15 +1526,26 @@ ARG PG_VERSION
 WORKDIR /ext-src
 RUN case "${PG_VERSION:?}" in \
     "v17") \
+        export PGX_ULID_VERSION=0.2.0 \
+        export PGX_ULID_CHECKSUM=cef6a9a2e5e7bd1a10a18989286586ee9e6c1c06005a4055cff190de41bf3e9f \
+        ;; \
+    "v18") \
+        export PGX_ULID_VERSION=0.2.2 \
+        export PGX_ULID_CHECKSUM=11cad4bdd241c418f9d35763a85267724e973543c63d65c813e25d305aedbcdf \
         ;; \
     *) \
         echo "skipping the version of pgx_ulid for $PG_VERSION" && exit 0 \
         ;; \
     esac && \
-    wget https://github.com/pksunkara/pgx_ulid/archive/refs/tags/v0.2.0.tar.gz -O pgx_ulid.tar.gz && \
-    echo "cef6a9a2e5e7bd1a10a18989286586ee9e6c1c06005a4055cff190de41bf3e9f pgx_ulid.tar.gz" | sha256sum --check && \
+    wget https://github.com/pksunkara/pgx_ulid/archive/refs/tags/v${PGX_ULID_VERSION}.tar.gz -O pgx_ulid.tar.gz && \
+    echo "${PGX_ULID_CHECKSUM} pgx_ulid.tar.gz" | sha256sum --check && \
     mkdir pgx_ulid-src && cd pgx_ulid-src && tar xzf ../pgx_ulid.tar.gz --strip-components=1 -C . && \
-    sed -i 's/pgrx       = "^0.12.7"/pgrx       = { version = "0.12.9", features = [ "unsafe-postgres" ] }/g' Cargo.toml
+    if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml && \
+        sed -i 's/^pgrx-tests *=.*/pgrx-tests = "=0.16.1"/' Cargo.toml; \
+    else \
+        sed -i 's/pgrx       = "^0.12.7"/pgrx       = { version = "0.12.9", features = [ "unsafe-postgres" ] }/g' Cargo.toml; \
+    fi
 
 FROM rust-extensions-build-pgrx12 AS pgx_ulid-pgrx12-build
 ARG PG_VERSION
@@ -1365,8 +1571,19 @@ ARG PG_VERSION
 # Do not update without approve from proxy team
 # Make sure the version is reflected in proxy/src/serverless/local_conn_pool.rs
 WORKDIR /ext-src
-RUN wget https://github.com/neondatabase/pg_session_jwt/archive/refs/tags/v0.3.1.tar.gz -O pg_session_jwt.tar.gz && \
-    echo "62fec9e472cb805c53ba24a0765afdb8ea2720cfc03ae7813e61687b36d1b0ad pg_session_jwt.tar.gz" | sha256sum --check && \
+# On v18 these need the upstream release that moved to pgrx 0.16.1.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_SESSION_JWT_VERSION=0.5.0 \
+        export PG_SESSION_JWT_CHECKSUM=c2167d31942b8642b4b8cb9bf96575a41f8a58e1804ad64fb03f88dd1a457f3c \
+    ;; \
+    *) \
+        export PG_SESSION_JWT_VERSION=0.3.1 \
+        export PG_SESSION_JWT_CHECKSUM=62fec9e472cb805c53ba24a0765afdb8ea2720cfc03ae7813e61687b36d1b0ad \
+    ;; \
+    esac && \
+    wget https://github.com/neondatabase/pg_session_jwt/archive/refs/tags/v${PG_SESSION_JWT_VERSION}.tar.gz -O pg_session_jwt.tar.gz && \
+    echo "${PG_SESSION_JWT_CHECKSUM} pg_session_jwt.tar.gz" | sha256sum --check && \
     mkdir pg_session_jwt-src && cd pg_session_jwt-src && tar xzf ../pg_session_jwt.tar.gz --strip-components=1 -C . && \
     sed -i 's/pgrx = "0.12.6"/pgrx = { version = "0.12.9", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
     sed -i 's/version = "0.12.6"/version = "0.12.9"/g' pgrx-tests/Cargo.toml && \
@@ -1375,9 +1592,13 @@ RUN wget https://github.com/neondatabase/pg_session_jwt/archive/refs/tags/v0.3.1
     sed -i 's/pgrx-pg-config = "=0.12.6"/pgrx-pg-config = "=0.12.9"/g' pgrx-tests/Cargo.toml
 
 FROM rust-extensions-build-pgrx12 AS pg_session_jwt-build
+ARG PG_VERSION
 COPY --from=pg_session_jwt-src /ext-src/ /ext-src/
 WORKDIR /ext-src/pg_session_jwt-src
-RUN cargo pgrx install --release
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml; \
+    fi; \
+    cargo pgrx install --release
 
 #########################################################################################
 #
@@ -1394,11 +1615,28 @@ COPY compute/patches/anon_v2.patch .
 # This is an experimental extension, never got to real production.
 # !Do not remove! It can be present in shared_preload_libraries and compute will fail to start if library is not found.
 ENV PATH="/usr/local/pgsql/bin/:$PATH"
-RUN wget https://gitlab.com/dalibo/postgresql_anonymizer/-/archive/2.1.0/postgresql_anonymizer-latest.tar.gz -O pg_anon.tar.gz && \
-    echo "48e7f5ae2f1ca516df3da86c5c739d48dd780a4e885705704ccaad0faa89d6c0  pg_anon.tar.gz" | sha256sum --check && \
+# 2.1.0 only declares features pg13..pg17, so a v18 build fails with
+# "the package 'anon' does not contain this feature: pg18". 2.5.1 adds pg18 and
+# moves to pgrx 0.16.1. anon_v2.patch applies to both.
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_ANON_VERSION=2.5.1 \
+        export PG_ANON_CHECKSUM=93643b486b710baf325d1d05707b9eaa25ef328a622eec1f04f6f4a7d308aaea \
+    ;; \
+    *) \
+        export PG_ANON_VERSION=2.1.0 \
+        export PG_ANON_CHECKSUM=48e7f5ae2f1ca516df3da86c5c739d48dd780a4e885705704ccaad0faa89d6c0 \
+    ;; \
+    esac && \
+    wget https://gitlab.com/dalibo/postgresql_anonymizer/-/archive/${PG_ANON_VERSION}/postgresql_anonymizer-latest.tar.gz -O pg_anon.tar.gz && \
+    echo "${PG_ANON_CHECKSUM}  pg_anon.tar.gz" | sha256sum --check && \
     mkdir pg_anon-src && cd pg_anon-src && tar xzf ../pg_anon.tar.gz --strip-components=1 -C . && \
     find /usr/local/pgsql -type f | sed 's|^/usr/local/pgsql/||' > /before.txt && \
-    sed -i 's/pgrx = "0.14.1"/pgrx = { version = "=0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml && \
+    if [ "${PG_VERSION:?}" = "v18" ]; then \
+        sed -i 's/^pgrx *=.*/pgrx = { version = "=0.16.1", features = [ "unsafe-postgres" ] }/' Cargo.toml; \
+    else \
+        sed -i 's/pgrx = "0.14.1"/pgrx = { version = "=0.14.1", features = [ "unsafe-postgres" ] }/g' Cargo.toml; \
+    fi && \
     patch -p1 < /ext-src/anon_v2.patch
 
 FROM rust-extensions-build-pgrx14 AS pg-anon-pg-build
@@ -1447,9 +1685,21 @@ ARG PG_VERSION
 
 # pg_ivm v1.9 supports v17
 # last release v1.9 - Jul 31
+# v1.9 does not build against v18 (ExecutorRun and CheckIndexCompatible changed
+# signature). v1.12 does; note it also moves create_immv() into the pgivm schema.
 WORKDIR /ext-src
-RUN wget https://github.com/sraoss/pg_ivm/archive/refs/tags/v1.9.tar.gz -O pg_ivm.tar.gz && \
-    echo "59e15722939f274650abf637f315dd723c87073496ca77236b044cb205270d8b pg_ivm.tar.gz" | sha256sum --check && \
+RUN case "${PG_VERSION:?}" in \
+    "v18") \
+        export PG_IVM_VERSION=1.12 \
+        export PG_IVM_CHECKSUM=29ecb5754e2507bac95210ac7e9a29869471f1b8c9872acfd3786f4666c0fbf3 \
+    ;; \
+    *) \
+        export PG_IVM_VERSION=1.9 \
+        export PG_IVM_CHECKSUM=59e15722939f274650abf637f315dd723c87073496ca77236b044cb205270d8b \
+    ;; \
+    esac && \
+    wget https://github.com/sraoss/pg_ivm/archive/refs/tags/v${PG_IVM_VERSION}.tar.gz -O pg_ivm.tar.gz && \
+    echo "${PG_IVM_CHECKSUM} pg_ivm.tar.gz" | sha256sum --check && \
     mkdir pg_ivm-src && cd pg_ivm-src && tar xzf ../pg_ivm.tar.gz --strip-components=1 -C .
 
 FROM pg-build AS pg_ivm-build
@@ -1492,7 +1742,19 @@ FROM build-deps AS pg_mooncake-src
 ARG PG_VERSION
 WORKDIR /ext-src
 COPY compute/patches/duckdb_v113.patch .
-RUN wget https://github.com/Mooncake-Labs/pg_mooncake/releases/download/v0.1.2/pg_mooncake-0.1.2.tar.gz -O pg_mooncake.tar.gz && \
+# pg_mooncake 0.1.2 (Feb 2025) is still the latest release, and it does not
+# build against PostgreSQL 18. Its columnstore table AM uses
+# TupleDescData.attrs, which v18 replaced with compact_attrs, and its
+# TableAmRoutine initializer carries more members than v18's struct after the
+# bitmap heap scan rework:
+#   columnstore_handler.cpp:147: 'struct TupleDescData' has no member named 'attrs'
+#   columnstore_handler.cpp:295: too many initializers for 'const TableAmRoutine'
+# Porting a third-party table AM across that change is out of scope, and
+# pg_mooncake is gated behind neon.unstable_extensions anyway.
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        echo "pg_mooncake has no PostgreSQL 18 support, skipping" && exit 0; \
+    fi; \
+    wget https://github.com/Mooncake-Labs/pg_mooncake/releases/download/v0.1.2/pg_mooncake-0.1.2.tar.gz -O pg_mooncake.tar.gz && \
     echo "4550473784fcdd2e1e18062bc01eb9c286abd27cdf5e11a4399be6c0a426ba90 pg_mooncake.tar.gz" | sha256sum --check && \
     mkdir pg_mooncake-src && cd pg_mooncake-src && tar xzf ../pg_mooncake.tar.gz --strip-components=1 -C . && \
     cd third_party/duckdb && patch -p1 < /ext-src/duckdb_v113.patch && cd ../.. && \
@@ -1501,10 +1763,15 @@ RUN wget https://github.com/Mooncake-Labs/pg_mooncake/releases/download/v0.1.2/p
 
 FROM rust-extensions-build AS pg_mooncake-build
 COPY --from=pg_mooncake-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pg_mooncake-src
-RUN make release -j $(getconf _NPROCESSORS_ONLN) && \
-    make install -j $(getconf _NPROCESSORS_ONLN) && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_mooncake.control
+# pg_mooncake-src produces nothing on the versions where pg_mooncake is skipped
+# (v18), so guard on the source directory the way rum-build and plv8-build do.
+WORKDIR /ext-src
+RUN if [ -d pg_mooncake-src ]; then \
+        cd pg_mooncake-src && \
+        make release -j $(getconf _NPROCESSORS_ONLN) && \
+        make install -j $(getconf _NPROCESSORS_ONLN) && \
+        echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_mooncake.control; \
+    fi
 
 #########################################################################################
 #
@@ -1513,6 +1780,7 @@ RUN make release -j $(getconf _NPROCESSORS_ONLN) && \
 #
 #########################################################################################
 FROM build-deps AS pg_duckdb-src
+ARG PG_VERSION
 WORKDIR /ext-src
 COPY compute/patches/pg_duckdb_v031.patch .
 COPY compute/patches/duckdb_v120.patch .
@@ -1520,7 +1788,24 @@ COPY compute/patches/duckdb_v120.patch .
 # allow {privileged_role_name} to execute some functions that in pg_duckdb are available to superuser only:
 # - extension management function duckdb.install_extension()
 # - access to duckdb.extensions table and its sequence
-RUN git clone --depth 1 --branch v0.3.1 https://github.com/duckdb/pg_duckdb.git pg_duckdb-src && \
+#
+# v0.3.1 predates PostgreSQL 18 and hits four separate API changes:
+#   POSIX_COLLATION_OID / ExplainPropertyText / MemoryContextReset not declared,
+#   and "cannot convert 'Node*' to 'Query*' in assignment".
+# pg_duckdb v1.1.1 does support 14..18, so this is a version bump rather than a
+# port -- but it is not a drop-in. Both local patches would need rebasing:
+#   - pg_duckdb_v031.patch renames libduckdb -> libduckdb_pg_duckdb so that
+#     pg_duckdb (duckdb 1.2.0) and pg_mooncake (duckdb 1.1.3) can coexist, and
+#     appends the neon.privileged_role_name GRANTs to
+#     sql/pg_duckdb--0.2.0--0.3.0.sql, a file the 1.x SQL layout replaces with
+#     pg_duckdb--1.0.0.sql plus pg_duckdb--1.0.0--1.1.0.sql.
+#   - duckdb_v120.patch renames the CMake target in the vendored duckdb 1.2.0,
+#     which 1.1.1 does not vendor.
+# Left for a follow-up; each build iteration compiles duckdb from source.
+RUN if [ "${PG_VERSION:?}" = "v18" ]; then \
+        echo "pg_duckdb 0.3.1 has no PostgreSQL 18 support, skipping" && exit 0; \
+    fi; \
+    git clone --depth 1 --branch v0.3.1 https://github.com/duckdb/pg_duckdb.git pg_duckdb-src && \
     cd pg_duckdb-src && \
     git submodule update --init --recursive && \
     patch -p1 < /ext-src/pg_duckdb_v031.patch && \
@@ -1530,9 +1815,14 @@ RUN git clone --depth 1 --branch v0.3.1 https://github.com/duckdb/pg_duckdb.git 
 FROM pg-build AS pg_duckdb-build
 ARG PG_VERSION
 COPY --from=pg_duckdb-src /ext-src/ /ext-src/
-WORKDIR /ext-src/pg_duckdb-src
-RUN make install -j $(getconf _NPROCESSORS_ONLN) && \
-    echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_duckdb.control
+# pg_duckdb-src produces nothing on the versions where pg_duckdb is skipped
+# (v18), so guard on the source directory the way rum-build and plv8-build do.
+WORKDIR /ext-src
+RUN if [ -d pg_duckdb-src ]; then \
+        cd pg_duckdb-src && \
+        make install -j $(getconf _NPROCESSORS_ONLN) && \
+        echo 'trusted = true' >> /usr/local/pgsql/share/extension/pg_duckdb.control; \
+    fi
 
 #########################################################################################
 #
@@ -1583,13 +1873,21 @@ RUN case "${PG_VERSION}" in \
     export PGAUDIT_VERSION=17.1 \
     export PGAUDIT_CHECKSUM=9c5f37504d393486cc75d2ced83f75f5899be64fa85f689d6babb833b4361e6c \
     ;; \
+    "v18") \
+    export PGAUDIT_VERSION=18.0 \
+    export PGAUDIT_CHECKSUM=988e8afeda320ebe0a3e632ef6b6bce5d3a08346c2e100a173a585c9521d1fa5 \
+    ;; \
     *) \
     echo "pgaudit is not supported on this PostgreSQL version" && exit 1;; \
     esac && \
     wget https://github.com/pgaudit/pgaudit/archive/refs/tags/${PGAUDIT_VERSION}.tar.gz -O pgaudit.tar.gz && \
     echo "${PGAUDIT_CHECKSUM} pgaudit.tar.gz" | sha256sum --check && \
     mkdir pgaudit-src && cd pgaudit-src && tar xzf ../pgaudit.tar.gz --strip-components=1 -C . && \
-    patch -p1 < "/ext-src/pgaudit-parallel_workers-${PG_VERSION}.patch"
+    # pgaudit 18.0 carries the parallel-worker suppression upstream, so the patch
+    # is a no-op there (and would fail as already-applied).
+    if [ "${PG_VERSION}" != "v18" ]; then \
+        patch -p1 < "/ext-src/pgaudit-parallel_workers-${PG_VERSION}.patch"; \
+    fi
 
 FROM pg-build AS pgaudit-build
 COPY --from=pgaudit-src /ext-src/ /ext-src/
@@ -1607,7 +1905,7 @@ FROM build-deps AS pgauditlogtofile-src
 ARG PG_VERSION
 WORKDIR /ext-src
 RUN case "${PG_VERSION}" in \
-    "v14" | "v15" | "v16" | "v17") \
+    "v14" | "v15" | "v16" | "v17" | "v18") \
     export PGAUDITLOGTOFILE_VERSION=v1.6.4 \
     export PGAUDITLOGTOFILE_CHECKSUM=ef801eb09c26aaa935c0dabd92c81eb9ebe338930daa9674d420a280c6bc2d70 \
     ;; \
@@ -1949,7 +2247,7 @@ RUN apt update && \
       bullseye) \
         VERSION_INSTALLS="libicu67 libgdal28 libproj19"; \
       ;; \
-      # Version-specific installs for Bookworm (PG17):
+      # Version-specific installs for Bookworm (PG17, PG18):
       # libicu72, locales for collations (including ICU and plpgsql_check)
       # libgdal32, libproj25 for PostGIS
       bookworm) \

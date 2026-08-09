@@ -252,13 +252,15 @@ pub struct ControlFile {
 
 impl ControlFile {
     pub(crate) fn new(control_file_buf: Bytes) -> Result<Self, anyhow::Error> {
-        // XXX ControlFileData is version-specific, we're always using v14 here. v17 had changes.
-        let control_file_data = ControlFileData::decode(&control_file_buf)?;
+        // The layout is version-specific; decode_control_file() picks the right
+        // one based on the pg_control_version recorded in the file.
+        let control_file_data = postgres_ffi::decode_control_file(&control_file_buf)?;
         let control_file = ControlFile {
             control_file_data,
             control_file_buf,
         };
         control_file.try_pg_version()?; // so that we can offer infallible pg_version()
+        crate::import_datadir::ensure_no_data_checksums(&control_file.control_file_data)?;
         Ok(control_file)
     }
     pub(crate) fn base_lsn(&self) -> Lsn {
@@ -282,6 +284,7 @@ impl ControlFile {
             202209061 => PgMajorVersion::PG15,
             202307071 => PgMajorVersion::PG16,
             202406281 => PgMajorVersion::PG17,
+            202506291 => PgMajorVersion::PG18,
             catversion => {
                 anyhow::bail!("unrecognized catalog version {catversion}")
             }

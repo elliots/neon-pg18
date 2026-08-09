@@ -52,7 +52,7 @@ function cleanup() {
     docker compose down
 }
 
-for pg_version in ${TEST_VERSION_ONLY-14 15 16 17}; do
+for pg_version in ${TEST_VERSION_ONLY-14 15 16 17 18}; do
     pg_version=${pg_version/v/}
     echo "clean up containers if exist"
     cleanup

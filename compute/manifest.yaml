@@ -93,6 +93,18 @@ pg_settings:
     hot_standby: "on"
 
   per_version:
+    18:
+      common:
+        # v18 performs every buffer read through the AIO subsystem. Neon fetches
+        # pages over the network and completes those IOs inline, so the default
+        # worker-based method only adds machinery with nothing to do.
+        io_method: "sync"
+        # Same rationale as v17 below: readahead still hurts more than it helps.
+        io_combine_limit: "1"
+      replica:
+        # prefetching of blocks referenced in WAL doesn't make sense for us
+        # Neon hot standby ignores pages that are not in the shared_buffers
+        recovery_prefetch: "off"
     17:
       common:
         # PostgreSQL 17 has a new IO system called "read stream", which can combine IOs up to some

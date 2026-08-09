@@ -94,6 +94,18 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         initdb_command.args(["--locale-provider", locale_provider]);
     }
 
+    // PostgreSQL 18 flipped initdb's default for data page checksums from off to
+    // on. Neon does not store pages as plain files: the pageserver reconstructs
+    // them, and synthesizes some of them outright (zero-filled gap blocks when a
+    // relation is extended, relations produced by a FILE_COPY CREATE DATABASE,
+    // ...). Those synthesized pages carry no valid checksum, so a checksummed
+    // cluster fails to read them with "invalid page in block N".
+    //
+    // Keep checksums off, as on v14..v17, until the storage layer computes them.
+    if pg_version >= PgMajorVersion::PG18 {
+        initdb_command.arg("--no-data-checksums");
+    }
+
     let initdb_proc = initdb_command.spawn().map_err(Error::Spawn)?;
 
     // Ideally we'd select here with the cancellation token, but the problem is that

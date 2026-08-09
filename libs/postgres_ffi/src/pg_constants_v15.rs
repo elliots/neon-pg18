@@ -15,6 +15,9 @@ pub const BKPIMAGE_COMPRESS_ZSTD: u8 = 0x10; /* page image is compressed */
 
 pub const SIZEOF_RELMAPFILE: usize = 512; /* sizeof(RelMapFile) in relmapper.c */
 
+/// sizeof(xl_xact_stats_item) in src/include/access/xact.h.
+pub const SIZEOF_XL_XACT_STATS_ITEM: usize = 12;
+
 pub use super::super::v14::bindings::PGDATA_SUBDIRS;
 
 pub fn bkpimg_is_compressed(bimg_info: u8) -> bool {

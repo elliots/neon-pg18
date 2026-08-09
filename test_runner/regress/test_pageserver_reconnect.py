@@ -66,6 +66,13 @@ def test_pageserver_reconnect_failure(neon_simple_env: NeonEnv):
     cur.execute("select pg_reload_conf()")
     try:
         cur.execute("select count(*) from pg_class")
-    except psycopg2.errors.QueryCanceled:
+    except (
+        psycopg2.errors.QueryCanceled,
+        psycopg2.errors.SqlclientUnableToEstablishSqlconnection,
+    ):
+        # Either outcome means the pageserver connection failed, which is all this
+        # test needs. Which one you get depends on whether the reconnect attempts
+        # run out before statement_timeout does; an invalid URI parameter fails
+        # without a network round trip, so on v18 the attempts are used up first.
         log.info("Connection to PS failed")
     assert not endpoint.log_contains("ERROR:  cannot wait on socket event without a socket.*")

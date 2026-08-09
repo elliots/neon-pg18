@@ -6,6 +6,7 @@ import re
 import shutil
 import tarfile
 from contextlib import closing
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,17 +16,20 @@ from fixtures.pageserver.utils import (
     timeline_delete_wait_completed,
     wait_for_last_record_lsn,
 )
+from fixtures.neon_fixtures import PgBin, VanillaPostgres
+from fixtures.pg_version import PgVersion
 from fixtures.remote_storage import RemoteStorageKind
-from fixtures.utils import assert_pageserver_backups_equal, subprocess_capture
+from fixtures.utils import (
+    assert_pageserver_backups_equal,
+    run_only_on_postgres,
+    subprocess_capture,
+)
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from fixtures.neon_fixtures import (
         Endpoint,
         NeonEnv,
         NeonEnvBuilder,
-        PgBin,
     )
 
 
@@ -146,6 +150,78 @@ def test_import_from_vanilla(test_output_dir, pg_bin, vanilla_pg, neon_env_build
     assert endpoint.safe_psql("select count(*) from t") == [(300000,)]
 
     vanilla_pg.stop()
+
+
+@run_only_on_postgres(
+    [PgVersion.DEFAULT, PgVersion.V18],
+    reason="the check itself is version-independent, but v18 is the version that "
+    "makes a checksummed cluster the default thing to arrive",
+)
+def test_import_rejects_data_checksums(
+    test_output_dir, port_distributor, pg_distrib_dir, pg_version, neon_env_builder
+):
+    """
+    A cluster with data page checksums is refused at import, with an error that
+    says why.
+
+    Neon reconstructs pages instead of storing them, and synthesizes some (gap
+    blocks from a relation extension, the relations of a FILE_COPY CREATE
+    DATABASE) with no checksum at all, so an imported checksummed cluster fails
+    its first read of one with "invalid page in block N" -- far from the import
+    that caused it. v18 is what makes this reachable by accident: it flipped
+    initdb's default to checksums on, so a basebackup of a stock cluster now has
+    them unless the operator opted out.
+    """
+    # Not the vanilla_pg fixture: it passes --no-data-checksums on v18, which is
+    # exactly what this test needs to not happen.
+    pgdatadir = test_output_dir / "pgdata-checksums"
+    pg_bin = PgBin(test_output_dir, pg_distrib_dir, pg_version)
+    port = port_distributor.get_port()
+    pg_bin.run_capture(["initdb", "--pgdata", str(pgdatadir), "--data-checksums"])
+
+    with VanillaPostgres(pgdatadir, pg_bin, port, init=False) as vanilla_pg:
+        vanilla_pg.start()
+        assert vanilla_pg.safe_psql("show data_checksums") == [("on",)]
+        vanilla_pg.safe_psql("create table t as select generate_series(1, 100) g")
+        vanilla_pg.safe_psql("CHECKPOINT")
+
+        basebackup_dir = os.path.join(test_output_dir, "basebackup")
+        os.mkdir(basebackup_dir)
+        pg_bin.run(
+            ["pg_basebackup", "-F", "tar", "-d", vanilla_pg.connstr(), "-D", basebackup_dir]
+        )
+        with open(os.path.join(basebackup_dir, "backup_manifest")) as f:
+            manifest = json.load(f)
+            start_lsn = manifest["WAL-Ranges"][0]["Start-LSN"]
+            end_lsn = manifest["WAL-Ranges"][0]["End-LSN"]
+
+        env = neon_env_builder.init_start()
+        tenant = TenantId.generate()
+        env.pageserver.tenant_create(tenant)
+        env.pageserver.allowed_errors.extend(
+            [
+                ".*Failed to import basebackup.*",
+                ".*data page checksums.*",
+            ]
+        )
+
+        with pytest.raises(RuntimeError):
+            env.neon_cli.timeline_import(
+                tenant_id=tenant,
+                timeline_id=TimelineId.generate(),
+                new_branch_name="import_checksums",
+                base_tarfile=Path(basebackup_dir) / "base.tar",
+                base_lsn=start_lsn,
+                wal_tarfile=Path(basebackup_dir) / "pg_wal.tar",
+                end_lsn=end_lsn,
+                pg_version=env.pg_version,
+            )
+
+        # The point of the fix: the failure names the cause, rather than
+        # surfacing later as a corrupt page.
+        assert env.pageserver.log_contains(".*data page checksums enabled.*")
+
+        vanilla_pg.stop()
 
 
 def test_import_from_pageserver_small(

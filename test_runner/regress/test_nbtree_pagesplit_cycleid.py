@@ -2,6 +2,7 @@ import threading
 import time
 
 from fixtures.neon_fixtures import NeonEnv
+from fixtures.pg_version import PgVersion
 
 BTREE_NUM_CYCLEID_PAGES = """
     WITH lsns AS (
@@ -119,8 +120,16 @@ def test_nbtree_pagesplit_cycleid(neon_simple_env: NeonEnv):
     # check that our expectations are correct
     ses1.execute(BTREE_NUM_CYCLEID_PAGES)
     pages = ses1.fetchall()
-    assert len(pages) == 1 and pages[0][0] == 3, (
-        f"3 page splits with cycle ID expected; actual {pages}"
+    # A split only needs a cycle ID if the concurrent vacuum has not reached
+    # that page yet, so the count depends on how far the vacuum has advanced.
+    # v18 rebuilt btvacuumscan() on the read stream API
+    # (read_stream_begin_relation with READ_STREAM_MAINTENANCE | READ_STREAM_FULL
+    # | READ_STREAM_USE_BATCHING, replacing the explicit prefetch_blkno walk), so
+    # it reads ahead further by the time the splits happen and one fewer page
+    # needs stamping. The cycle ID machinery itself is unchanged between the two.
+    expected = 2 if env.pg_version >= PgVersion.V18 else 3
+    assert len(pages) == 1 and pages[0][0] == expected, (
+        f"{expected} page splits with cycle ID expected; actual {pages}"
     )
 
     # final cleanup

@@ -62,6 +62,7 @@ macro_rules! for_all_postgres_versions {
         $macro!(v15);
         $macro!(v16);
         $macro!(v17);
+        $macro!(v18);
     };
 }
 
@@ -97,6 +98,7 @@ macro_rules! dispatch_pgversion {
                 $crate::PgMajorVersion::PG15 => v15,
                 $crate::PgMajorVersion::PG16 => v16,
                 $crate::PgMajorVersion::PG17 => v17,
+                $crate::PgMajorVersion::PG18 => v18,
             ]
         )
     };
@@ -129,6 +131,7 @@ macro_rules! enum_pgversion_dispatch {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         )
     };
@@ -159,6 +162,7 @@ macro_rules! enum_pgversion {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         }
     };
@@ -172,6 +176,7 @@ macro_rules! enum_pgversion {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         }
     };
@@ -267,6 +272,49 @@ pub fn generate_wal_segment(
         pg_version,
         pgv::xlog_utils::generate_wal_segment(segno, system_id, lsn)
     )
+}
+
+/// Offset of `pg_control_version` within ControlFileData. This field sits in the
+/// prefix that is identical in every major version we support, so it can always
+/// be read before the rest of the file is interpreted.
+const PG_CONTROL_VERSION_OFFSET: usize =
+    std::mem::offset_of!(v14::bindings::ControlFileData, pg_control_version);
+
+/// Decode a PostgreSQL control file whose major version is not known up front.
+///
+/// A control file records its own `PG_CONTROL_VERSION`, so we use that to pick
+/// the layout to validate the CRC against. This matters because PostgreSQL 18
+/// added a `default_char_signedness` field ahead of `mock_authentication_nonce`,
+/// which moved `crc` from offset 288 to 292; validating a v18 control file with
+/// the v14 layout fails with a bogus CRC mismatch.
+///
+/// The returned struct uses the v14 layout. Every field up to and including
+/// `data_checksum_version` is laid out identically in v14..v18, and `crc` is
+/// filled in from the correct offset, so the only field that is not meaningful
+/// for a v18 file is `mock_authentication_nonce`, which Neon never reads.
+pub fn decode_control_file(buf: &[u8]) -> anyhow::Result<ControlFileData> {
+    if buf.len() < PG_CONTROL_VERSION_OFFSET + size_of::<u32>() {
+        anyhow::bail!("control file is too short");
+    }
+
+    let pg_control_version = u32::from_ne_bytes(
+        buf[PG_CONTROL_VERSION_OFFSET..PG_CONTROL_VERSION_OFFSET + size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+
+    // The offsets are taken from the vendored headers of each major version via
+    // offset_of!, so they stay correct if a future minor release shifts them.
+    let offsetof_crc = match pg_control_version {
+        1400 => v14::bindings::ControlFileData::pg_control_crc_offset(),
+        1500 => v15::bindings::ControlFileData::pg_control_crc_offset(),
+        1600 => v16::bindings::ControlFileData::pg_control_crc_offset(),
+        1700 => v17::bindings::ControlFileData::pg_control_crc_offset(),
+        1800 => v18::bindings::ControlFileData::pg_control_crc_offset(),
+        other => anyhow::bail!("unrecognized pg_control_version {other}"),
+    };
+
+    ControlFileData::decode_with_crc_offset(buf, offsetof_crc)
 }
 
 pub fn generate_pg_control(

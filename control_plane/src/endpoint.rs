@@ -488,6 +488,15 @@ impl Endpoint {
         // Load the 'neon' extension
         conf.append("shared_preload_libraries", "neon");
 
+        // PostgreSQL 18 routes every buffer read through the AIO subsystem. Neon
+        // fetches pages over the network and completes those IOs inline, so the
+        // default worker-based method only adds machinery with nothing to do.
+        // This mirrors how Neon runs v18 ("PostgreSQL 18 currently runs with
+        // io_method = 'sync'"); async I/O support is still to come.
+        if self.pg_version >= PgMajorVersion::PG18 {
+            conf.append("io_method", "sync");
+        }
+
         conf.append_line("");
         // Replication-related configurations, such as WAL sending
         match &self.mode {

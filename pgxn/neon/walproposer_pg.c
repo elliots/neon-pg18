@@ -1459,7 +1459,15 @@ StartProposerReplication(WalProposer *wp, StartReplicationCmd *cmd)
 
 	if (cmd->slotname)
 	{
+		/*
+		 * PG18 added an 'error_if_invalid' argument. Core's StartReplication()
+		 * passes true, so mirror that here.
+		 */
+#if PG_MAJORVERSION_NUM >= 18
+		ReplicationSlotAcquire(cmd->slotname, true, true);
+#else
 		ReplicationSlotAcquire(cmd->slotname, true);
+#endif
 		if (SlotIsLogical(MyReplicationSlot))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

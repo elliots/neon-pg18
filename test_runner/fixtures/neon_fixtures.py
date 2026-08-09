@@ -3495,7 +3495,15 @@ class VanillaPostgres(PgProtocol):
         self.pg_bin = pg_bin
         self.running = False
         if init:
-            self.pg_bin.run_capture(["initdb", "--pgdata", str(pgdatadir)])
+            cmd = ["initdb", "--pgdata", str(pgdatadir)]
+            if int(str(pg_bin.pg_version)) >= 18:
+                # v18 turns data checksums on by default. Neon reconstructs pages
+                # rather than storing them verbatim, so a checksummed cluster that
+                # is imported into Neon fails to read them back with
+                # "invalid page in block N". libs/postgres_initdb does the same for
+                # the clusters Neon creates itself.
+                cmd.append("--no-data-checksums")
+            self.pg_bin.run_capture(cmd)
         self.configure([f"port = {port}\n"])
 
     def enable_tls(self):

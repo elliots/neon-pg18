@@ -9,8 +9,19 @@
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "storage/buf_internals.h"
+#include "storage/lwlock.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+
+/*
+ * PostgreSQL 18 removed Neon's LastWrittenLsn entry from lwlocklist.h, so the
+ * lock is no longer part of MainLWLockArray. Request our own named tranche
+ * instead, and keep the LastWrittenLsnLock spelling for the code below.
+ */
+#if PG_MAJORVERSION_NUM >= 18
+#define NEON_LWLSN_TRANCHE_NAME "neon_last_written_lsn"
+static LWLock *LastWrittenLsnLock = NULL;
+#endif
 
 
 
@@ -75,9 +86,18 @@ static XLogRecPtr SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 
 
 /* These hold the set_lwlsn_* hooks which were installed before ours, if any */
+/*
+ * PostgreSQL 18 removed the block-granularity hooks: core never called
+ * set_lwlsn_block_range_hook or set_lwlsn_block_v_hook, and the single
+ * set_lwlsn_block_hook call site in gist_indexsortbuild() turned out to be
+ * redundant with the smgr_bulk_*() write path. The neon_set_lwlsn_block*()
+ * functions themselves are still used directly from pagestore_smgr.c.
+ */
+#if PG_MAJORVERSION_NUM < 18
 static set_lwlsn_block_range_hook_type prev_set_lwlsn_block_range_hook = NULL;
 static set_lwlsn_block_v_hook_type prev_set_lwlsn_block_v_hook = NULL;
 static set_lwlsn_block_hook_type prev_set_lwlsn_block_hook = NULL;
+#endif
 static set_max_lwlsn_hook_type prev_set_max_lwlsn_hook = NULL;
 static set_lwlsn_relation_hook_type prev_set_lwlsn_relation_hook = NULL;
 static set_lwlsn_db_hook_type prev_set_lwlsn_db_hook = NULL;
@@ -92,12 +112,14 @@ init_lwlsncache(void)
 	
 	lwlc_register_gucs();
 
+#if PG_MAJORVERSION_NUM < 18
 	prev_set_lwlsn_block_range_hook = set_lwlsn_block_range_hook;
 	set_lwlsn_block_range_hook = neon_set_lwlsn_block_range;
 	prev_set_lwlsn_block_v_hook = set_lwlsn_block_v_hook;
 	set_lwlsn_block_v_hook = neon_set_lwlsn_block_v;
 	prev_set_lwlsn_block_hook = set_lwlsn_block_hook;
 	set_lwlsn_block_hook = neon_set_lwlsn_block;
+#endif
 	prev_set_max_lwlsn_hook = set_max_lwlsn_hook;
 	set_max_lwlsn_hook = neon_set_max_lwlsn;
 	prev_set_lwlsn_relation_hook = set_lwlsn_relation_hook;
@@ -115,6 +137,10 @@ LwLsnCacheShmemRequest(void)
 	requested_size += hash_estimate_size(lwlsn_cache_size, sizeof(LastWrittenLsnCacheEntry));
 
 	RequestAddinShmemSpace(requested_size);
+
+#if PG_MAJORVERSION_NUM >= 18
+	RequestNamedLWLockTranche(NEON_LWLSN_TRANCHE_NAME, 1);
+#endif
 }
 
 void
@@ -122,6 +148,11 @@ LwLsnCacheShmemInit(void)
 {
 	static HASHCTL info;
 	bool found;
+
+#if PG_MAJORVERSION_NUM >= 18
+	LastWrittenLsnLock = &(GetNamedLWLockTranche(NEON_LWLSN_TRANCHE_NAME))->lock;
+#endif
+
 	if (lwlsn_cache_size > 0)
 	{
 		info.keysize = sizeof(BufferTag);

@@ -211,6 +211,7 @@ impl DecodedWALRecord {
                 PgMajorVersion::PG15 => info == crate::v15::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG16 => info == crate::v16::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG17 => info == crate::v17::bindings::XLOG_DBASE_CREATE_FILE_COPY,
+                PgMajorVersion::PG18 => info == crate::v18::bindings::XLOG_DBASE_CREATE_FILE_COPY,
             }
         } else {
             false
@@ -888,6 +889,20 @@ pub mod v17 {
     }
 }
 
+pub mod v18 {
+    //! PostgreSQL 18 did not change the on-disk layout of any of the WAL
+    //! records decoded here, so every decoder is inherited from v17.
+    //!
+    //! The one xlog record format change in v18 that Neon cares about is the
+    //! widening of `xl_xact_stats_item` from 12 to 16 bytes; that is handled by
+    //! the per-version `SIZEOF_XL_XACT_STATS_ITEM` constant used by
+    //! [`super::XlXactParsedRecord::decode`], not by a distinct record type.
+    pub use super::v17::{
+        XlEndOfRecovery, XlHeapDelete, XlHeapInsert, XlHeapLock, XlHeapLockUpdated,
+        XlHeapMultiInsert, XlHeapUpdate, XlParameterChange, rm_neon,
+    };
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct XlSmgrCreate {
@@ -1005,7 +1020,12 @@ impl XlXactParsedRecord {
     /// Decode a XLOG_XACT_COMMIT/ABORT/COMMIT_PREPARED/ABORT_PREPARED
     /// record. This should agree with the ParseCommitRecord and ParseAbortRecord
     /// functions in PostgreSQL (in src/backend/access/rmgr/xactdesc.c)
-    pub fn decode(buf: &mut Bytes, mut xid: TransactionId, xl_info: u8) -> XlXactParsedRecord {
+    pub fn decode(
+        buf: &mut Bytes,
+        mut xid: TransactionId,
+        xl_info: u8,
+        pg_version: PgMajorVersion,
+    ) -> XlXactParsedRecord {
         let info = xl_info & pg_constants::XLOG_XACT_OPMASK;
         // The record starts with time of commit/abort
         let xact_time = buf.get_i64_le();
@@ -1058,8 +1078,12 @@ impl XlXactParsedRecord {
                 "XLOG_XACT_COMMIT-XACT_XINFO_HAS_DROPPED_STAT nitems {}",
                 nitems
             );
-            let sizeof_xl_xact_stats_item = 12;
-            buf.advance((nitems * sizeof_xl_xact_stats_item).try_into().unwrap());
+            // The size of xl_xact_stats_item grew from 12 to 16 bytes in v18,
+            // when the 32-bit `objoid` field was replaced by a 64-bit object id.
+            let sizeof_xl_xact_stats_item: usize =
+                dispatch_pgversion!(pg_version, pgv::bindings::SIZEOF_XL_XACT_STATS_ITEM);
+            let nitems: usize = nitems.try_into().unwrap();
+            buf.advance(nitems * sizeof_xl_xact_stats_item);
         }
 
         if xinfo & pg_constants::XACT_XINFO_HAS_INVALS != 0 {

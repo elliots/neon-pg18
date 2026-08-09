@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import wait_replica_caughtup
+from fixtures.pg_version import PgVersion
 from fixtures.utils import shared_buffers_for_max_cu
 
 if TYPE_CHECKING:
@@ -185,16 +186,24 @@ def test_physical_replication_config_mismatch_too_many_known_xids(neon_simple_en
             f"shared_buffers={shared_buffers_for_max_cu(2.0)}",  # prevent "no unpinned buffers available" error
         ],
     )
+    replica_config = [
+        "max_connections=5",
+        "autovacuum_max_workers=1",
+        "max_worker_processes=5",
+        "max_wal_senders=1",
+        "superuser_reserved_connections=0",
+    ]
+    if env.pg_version >= PgVersion.V18:
+        # v18 made autovacuum_max_workers runtime-changeable and sizes shared
+        # memory from autovacuum_worker_slots instead (default 16), so
+        # autovacuum_max_workers no longer shrinks MaxBackends and the
+        # KnownAssignedXids array stays large enough to hold every xid this
+        # test generates.
+        replica_config.append("autovacuum_worker_slots=1")
     secondary = env.endpoints.new_replica_start(
         origin=primary,
         endpoint_id="secondary",
-        config_lines=[
-            "max_connections=5",
-            "autovacuum_max_workers=1",
-            "max_worker_processes=5",
-            "max_wal_senders=1",
-            "superuser_reserved_connections=0",
-        ],
+        config_lines=replica_config,
     )
 
     p_con = primary.connect()
@@ -239,13 +248,19 @@ def test_physical_replication_config_mismatch_max_locks_per_transaction(neon_sim
             "max_locks_per_transaction = 100",
         ],
     )
+    replica_config = [
+        "max_connections=10",
+        "max_locks_per_transaction = 10",
+    ]
+    if env.pg_version >= PgVersion.V18:
+        # See the note in test_physical_replication_config_mismatch_too_many_known_xids:
+        # the lock table is sized from MaxBackends, which v18 derives from
+        # autovacuum_worker_slots rather than autovacuum_max_workers.
+        replica_config.append("autovacuum_worker_slots=1")
     secondary = env.endpoints.new_replica_start(
         origin=primary,
         endpoint_id="secondary",
-        config_lines=[
-            "max_connections=10",
-            "max_locks_per_transaction = 10",
-        ],
+        config_lines=replica_config,
     )
 
     n_tables = 1000

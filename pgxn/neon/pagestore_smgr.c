@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
+#include "access/slru.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
@@ -54,8 +55,12 @@
 #include "postmaster/interrupt.h"
 #include "port/pg_iovec.h"
 #include "replication/walsender.h"
+#if PG_MAJORVERSION_NUM >= 18
+#include "storage/aio.h"
+#endif
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/fd.h"
 #include "storage/fsm_internals.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
@@ -75,6 +80,27 @@
 #include "access/nbtree.h"
 #include "storage/bufpage.h"
 #include "access/xlog_internal.h"
+
+/*
+ * v18 calls every smgr entry point with interrupts held -- smgrnblocks(),
+ * smgrexists(), smgrstartreadv() and the rest all wrap the callback in
+ * HOLD_INTERRUPTS(). That is free for md.c, where the work is local. Ours
+ * talks to the pageserver over the network, and while interrupts are held
+ * CHECK_FOR_INTERRUPTS() does nothing, so statement_timeout and query
+ * cancellation cannot take effect for as long as the pageserver takes to
+ * answer.
+ *
+ * Wrap the blocking part of a callback in these so the wait stays
+ * cancellable. v14..v17 hold nothing here, so they expand to nothing.
+ */
+#if PG_MAJORVERSION_NUM >= 18
+#define NEON_INTERRUPTIBLE_BEGIN()	RESUME_INTERRUPTS()
+#define NEON_INTERRUPTIBLE_END()	HOLD_INTERRUPTS()
+#else
+#define NEON_INTERRUPTIBLE_BEGIN()	((void) 0)
+#define NEON_INTERRUPTIBLE_END()	((void) 0)
+#endif
+
 
 static char *hexdump_page(char *page);
 
@@ -771,7 +797,14 @@ neon_exists(SMgrRelation reln, ForkNumber forkNum)
 	neon_get_request_lsns(InfoFromSMgrRel(reln), forkNum,
 						  REL_METADATA_PSEUDO_BLOCKNO, &request_lsns, 1);
 
-	return communicator_exists(InfoFromSMgrRel(reln), forkNum, &request_lsns);
+	{
+		bool		exists;
+
+		NEON_INTERRUPTIBLE_BEGIN();
+		exists = communicator_exists(InfoFromSMgrRel(reln), forkNum, &request_lsns);
+		NEON_INTERRUPTIBLE_END();
+		return exists;
+	}
 }
 
 /*
@@ -1042,7 +1075,11 @@ neon_zeroextend(SMgrRelation reln, ForkNumber forkNum, BlockNumber blocknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg(NEON_TAG "cannot extend file \"%s\" beyond %u blocks",
+#if PG_MAJORVERSION_NUM >= 18
+						relpath(reln->smgr_rlocator, forkNum).str,
+#else
 						relpath(reln->smgr_rlocator, forkNum),
+#endif
 						InvalidBlockNumber)));
 
 	if (debug_compare_local)
@@ -1626,7 +1663,8 @@ neon_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const vo
 			break;
 
 		case RELPERSISTENCE_PERMANENT:
-			if (RelFileInfoEquals(unlogged_build_rel_info, InfoFromSMgrRel(reln)))
+			if (RelFileInfoEquals(unlogged_build_rel_info, InfoFromSMgrRel(reln)) ||
+				(!debug_compare_local && mdexists(reln, forknum)))
 			{
 #if PG_MAJORVERSION_NUM >= 17
 				mdwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
@@ -1703,7 +1741,8 @@ neon_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			break;
 
 		case RELPERSISTENCE_PERMANENT:
-			if (RelFileInfoEquals(unlogged_build_rel_info, InfoFromSMgrRel(reln)))
+			if (RelFileInfoEquals(unlogged_build_rel_info, InfoFromSMgrRel(reln)) ||
+				(!debug_compare_local && mdexists(reln, forknum)))
 			{
 				mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
 				return;
@@ -1774,7 +1813,9 @@ neon_nblocks(SMgrRelation reln, ForkNumber forknum)
 	neon_get_request_lsns(InfoFromSMgrRel(reln), forknum,
 						  REL_METADATA_PSEUDO_BLOCKNO, &request_lsns, 1);
 
+	NEON_INTERRUPTIBLE_BEGIN();
 	n_blocks = communicator_nblocks(InfoFromSMgrRel(reln), forknum, &request_lsns);
+	NEON_INTERRUPTIBLE_END();
 	update_cached_relsize(InfoFromSMgrRel(reln), forknum, n_blocks);
 
 	neon_log(SmgrTrace, "neon_nblocks: rel %u/%u/%u fork %u (request LSN %X/%08X): %u blocks",
@@ -1801,8 +1842,8 @@ neon_dbsize(Oid dbNode)
 
 	db_size = communicator_dbsize(dbNode, &request_lsns);
 
-	neon_log(SmgrTrace, "neon_dbsize: db %u (request LSN %X/%08X): %ld bytes",
-			 dbNode, LSN_FORMAT_ARGS(request_lsns.effective_request_lsn), db_size);
+	neon_log(SmgrTrace, "neon_dbsize: db %u (request LSN %X/%08X): " INT64_FORMAT " bytes",
+			 dbNode, LSN_FORMAT_ARGS(request_lsns.effective_request_lsn), (int64) db_size);
 
 	return db_size;
 }
@@ -2127,9 +2168,70 @@ neon_end_unlogged_build(SMgrRelation reln)
 
 #define STRPREFIX(str, prefix) (strncmp(str, prefix, strlen(prefix)) == 0)
 
+#if PG_MAJORVERSION_NUM >= 18
+static int neon_read_slru_segment_internal(const char *path, int64 segno, void *buffer);
+
+/*
+ * PG18's read_slru_segment_hook is responsible for writing out the downloaded
+ * segment itself and just reports whether the segment was found. (Before v18,
+ * slru.c allocated the buffer and did the writing.)
+ */
+static bool
+neon_read_slru_segment(const char *path, int64 segno)
+{
+	void	   *buffer;
+	int			n_blocks;
+	int			fd;
+	bool		ok = false;
+
+	buffer = palloc(SLRU_PAGES_PER_SEGMENT * BLCKSZ);
+
+	n_blocks = neon_read_slru_segment_internal(path, segno, buffer);
+	if (n_blocks <= 0)
+	{
+		pfree(buffer);
+		return false;
+	}
+
+	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", path)));
+
+	errno = 0;
+	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
+	if (pg_pwrite(fd, buffer, (size_t) n_blocks * BLCKSZ, 0) != (ssize_t) n_blocks * BLCKSZ)
+	{
+		pgstat_report_wait_end();
+		if (errno == 0)
+			errno = ENOSPC;
+		CloseTransientFile(fd);
+		pfree(buffer);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
+	}
+	pgstat_report_wait_end();
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", path)));
+
+	ok = true;
+	pfree(buffer);
+	return ok;
+}
+
+static int
+neon_read_slru_segment_internal(const char *path, int64 segno, void *buffer)
+{
+#else
 static int
 neon_read_slru_segment(SMgrRelation reln, const char* path, int segno, void* buffer)
 {
+#endif
 	XLogRecPtr	request_lsn,
 				not_modified_since;
 	SlruKind	kind;
@@ -2217,9 +2319,126 @@ AtEOXact_neon(XactEvent event, void *arg)
 	communicator_reconfigure_timeout_if_needed();
 }
 
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * PG18 replaced the smgr_hook with a registration API: an smgr registers
+ * itself with smgrregister() and then claims relations through smgr_owns().
+ * smgropen() consults the registered smgrs in reverse registration order, so
+ * returning false here falls back to md, which is always registered first.
+ */
+static bool
+neon_owns(RelFileLocator rlocator, ProcNumber backend, char relpersistence)
+{
+	/*
+	 * Temporary relations live in backend-local files and are handled by md,
+	 * matching what smgr_neon() did on earlier versions.
+	 */
+	return backend == INVALID_PROC_NUMBER;
+}
+
+/*
+ * PG18 asks the smgr how many blocks starting at 'blocknum' may be combined
+ * into a single I/O. We have no segment boundaries, but neon_readv() is bounded
+ * by PG_IOV_MAX entries, so report that.
+ */
+static uint32
+neon_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+{
+	return PG_IOV_MAX;
+}
+
+/*
+ * PG18's AIO machinery can hand an I/O to another process (an io_worker) and
+ * needs a file descriptor to re-issue it against. Pages served by Neon do not
+ * live in a local file, so there is nothing meaningful to return.
+ */
+static int
+neon_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+{
+	neon_log(ERROR, "neon_fd() is not supported: Neon relations are not backed by a local file");
+	return -1;					/* keep the compiler quiet */
+}
+
+/*
+ * PG18 reads exclusively through smgrstartreadv(): the buffer manager acquires
+ * a PgAioHandle and expects the smgr to attach an I/O to it. There is no
+ * smgr_readv() fallback.
+ *
+ * Neon pages come over the network, so there is no file descriptor to hand to
+ * pgaio_io_start_readv(). We fetch the pages synchronously, exactly as
+ * neon_readv() does, and then hand the already-complete I/O back to the AIO
+ * machinery with pgaio_io_complete_synchronously(). That runs the same staging
+ * and completion path a file-backed read would, so the callbacks registered
+ * above smgr (md_readv_complete, and the shared/local buffer callbacks) behave
+ * identically.
+ *
+ * We register PGAIO_HCB_MD_READV like md does: despite the name it is not
+ * md-specific, it just converts the byte count into a block count and reports
+ * short reads using the smgr target data.
+ */
+static void
+neon_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
+				BlockNumber blocknum, void **buffers, BlockNumber nblocks)
+{
+	/*
+	 * The read is performed inline, so tell the AIO subsystem not to try to
+	 * hand it off to an IO worker.
+	 */
+	pgaio_io_set_flag(ioh, PGAIO_HF_SYNCHRONOUS);
+
+	pgaio_io_set_target_smgr(ioh,
+							 reln,
+							 forknum,
+							 blocknum,
+							 nblocks,
+							 false);
+	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
+
+	/*
+	 * Fetch the pages. neon_readv() either fills every buffer or raises an
+	 * error, so a successful return always means a full read.
+	 *
+	 * smgrstartreadv() holds interrupts across this call, which costs nothing
+	 * for md.c because starting an IO there is local and cheap. Ours is a
+	 * round trip to the pageserver, and holding interrupts across it means
+	 * CHECK_FOR_INTERRUPTS() does nothing while we wait, so statement_timeout
+	 * and query cancellation cannot take effect. Allow interrupts for the
+	 * wait itself. The handle belongs to the current resource owner, so an
+	 * error raised here still releases it.
+	 */
+	NEON_INTERRUPTIBLE_BEGIN();
+	neon_readv(reln, forknum, blocknum, buffers, nblocks);
+	NEON_INTERRUPTIBLE_END();
+
+	pgaio_io_complete_synchronously(ioh, PGAIO_OP_READV,
+									(int) nblocks * BLCKSZ);
+}
+#endif							/* PG_MAJORVERSION_NUM >= 18 */
+
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * v18 calls each registered smgr's smgr_init() once per backend, from
+ * smgrinit() in InitPostgres(). That is where the per-backend setup that used
+ * to live in the smgr_init_hook belongs; smgr_init_neon() below now only does
+ * the one-time registration in the postmaster.
+ */
+static void
+neon_smgr_init(void)
+{
+	RegisterXactCallback(AtEOXact_neon, NULL);
+	neon_init();
+	communicator_init();
+}
+#endif
+
 static const struct f_smgr neon_smgr =
 {
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_name = "neon",
+	.smgr_init = neon_smgr_init,
+#else
 	.smgr_init = neon_init,
+#endif
 	.smgr_shutdown = NULL,
 	.smgr_open = neon_open,
 	.smgr_close = neon_close,
@@ -2230,7 +2449,13 @@ static const struct f_smgr neon_smgr =
 #if PG_MAJORVERSION_NUM >= 16
 	.smgr_zeroextend = neon_zeroextend,
 #endif
-#if PG_MAJORVERSION_NUM >= 17
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_prefetch = neon_prefetch,
+	.smgr_maxcombine = neon_maxcombine,
+	.smgr_readv = neon_readv,
+	.smgr_startreadv = neon_startreadv,
+	.smgr_writev = neon_writev,
+#elif PG_MAJORVERSION_NUM >= 17
 	.smgr_prefetch = neon_prefetch,
 	.smgr_readv = neon_readv,
 	.smgr_writev = neon_writev,
@@ -2247,13 +2472,24 @@ static const struct f_smgr neon_smgr =
 #if PG_MAJORVERSION_NUM >= 17
 	.smgr_registersync = neon_registersync,
 #endif
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * In v18 the unlogged-build and SLRU-download callbacks moved out of
+	 * f_smgr into standalone hook variables; they are installed by
+	 * smgr_init_neon() below.
+	 */
+	.smgr_fd = neon_fd,
+	.smgr_owns = neon_owns,
+#else
 	.smgr_start_unlogged_build = neon_start_unlogged_build,
 	.smgr_finish_unlogged_build_phase_1 = neon_finish_unlogged_build_phase_1,
 	.smgr_end_unlogged_build = neon_end_unlogged_build,
 
 	.smgr_read_slru_segment = neon_read_slru_segment,
+#endif
 };
 
+#if PG_MAJORVERSION_NUM < 18
 const f_smgr *
 smgr_neon(ProcNumber backend, NRelFileInfo rinfo)
 {
@@ -2264,7 +2500,32 @@ smgr_neon(ProcNumber backend, NRelFileInfo rinfo)
 	else
 		return &neon_smgr;
 }
+#endif
 
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * Called once from _PG_init(), i.e. in the postmaster while
+ * shared_preload_libraries is being processed. Backends inherit the
+ * registration across fork(); the per-backend work happens in neon_smgr_init().
+ */
+void
+smgr_init_neon(void)
+{
+	/*
+	 * md is registered first by core; smgropen() consults smgrs in reverse
+	 * registration order, so our smgr_owns() gets asked first and can decline
+	 * temporary relations.
+	 *
+	 * The callbacks that used to be f_smgr members are plain hook variables.
+	 */
+	(void) smgrregister(&neon_smgr);
+
+	start_unlogged_build_hook = neon_start_unlogged_build;
+	finish_unlogged_build_phase_1_hook = neon_finish_unlogged_build_phase_1;
+	end_unlogged_build_hook = neon_end_unlogged_build;
+	read_slru_segment_hook = neon_read_slru_segment;
+}
+#else
 void
 smgr_init_neon(void)
 {
@@ -2274,6 +2535,7 @@ smgr_init_neon(void)
 	neon_init();
 	communicator_init();
 }
+#endif
 
 
 static void

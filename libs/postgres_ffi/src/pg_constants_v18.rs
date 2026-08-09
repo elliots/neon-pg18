@@ -1,6 +1,6 @@
 use crate::PgMajorVersion;
 
-pub const MY_PGVERSION: PgMajorVersion = PgMajorVersion::PG17;
+pub const MY_PGVERSION: PgMajorVersion = PgMajorVersion::PG18;
 
 pub const XACT_XINFO_HAS_DROPPED_STATS: u32 = 1u32 << 8;
 
@@ -16,47 +16,25 @@ pub const BKPIMAGE_COMPRESS_ZSTD: u8 = 0x10; /* page image is compressed */
 pub const SIZEOF_RELMAPFILE: usize = 524; /* sizeof(RelMapFile) in relmapper.c */
 
 /// sizeof(xl_xact_stats_item) in src/include/access/xact.h.
-pub const SIZEOF_XL_XACT_STATS_ITEM: usize = 12;
+///
+/// PostgreSQL 18 replaced the single `Oid objoid` field with a 64-bit object ID
+/// split into `uint32 objid_lo` and `uint32 objid_hi`, which grew the struct
+/// from 12 to 16 bytes (see PostgreSQL commit that widened PgStat_HashKey.objid).
+pub const SIZEOF_XL_XACT_STATS_ITEM: usize = 16;
 
-// List of subdirectories inside pgdata.
-// Copied from src/bin/initdb/initdb.c
-pub const PGDATA_SUBDIRS: [&str; 23] = [
-    "global",
-    "pg_wal/archive_status",
-    "pg_wal/summaries",
-    "pg_commit_ts",
-    "pg_dynshmem",
-    "pg_notify",
-    "pg_serial",
-    "pg_snapshots",
-    "pg_subtrans",
-    "pg_twophase",
-    "pg_multixact",
-    "pg_multixact/members",
-    "pg_multixact/offsets",
-    "base",
-    "base/1",
-    "pg_replslot",
-    "pg_tblspc",
-    "pg_stat",
-    "pg_stat_tmp",
-    "pg_xact",
-    "pg_logical",
-    "pg_logical/snapshots",
-    "pg_logical/mappings",
-];
+// The list of subdirectories inside pgdata is unchanged from v17.
+pub use super::super::v17::bindings::PGDATA_SUBDIRS;
 
 pub fn bkpimg_is_compressed(bimg_info: u8) -> bool {
-    const ANY_COMPRESS_FLAG: u8 = BKPIMAGE_COMPRESS_PGLZ | BKPIMAGE_COMPRESS_LZ4 | BKPIMAGE_COMPRESS_ZSTD;
+    const ANY_COMPRESS_FLAG: u8 =
+        BKPIMAGE_COMPRESS_PGLZ | BKPIMAGE_COMPRESS_LZ4 | BKPIMAGE_COMPRESS_ZSTD;
 
     (bimg_info & ANY_COMPRESS_FLAG) != 0
 }
 
-
 pub const XLOG_HEAP2_PRUNE_ON_ACCESS: u8 = 0x10;
 pub const XLOG_HEAP2_PRUNE_VACUUM_SCAN: u8 = 0x20;
 pub const XLOG_HEAP2_PRUNE_VACUUM_CLEANUP: u8 = 0x30;
-
 
 pub const XLOG_OVERWRITE_CONTRECORD: u8 = 0xD0;
 pub const XLOG_CHECKPOINT_REDO: u8 = 0xE0;

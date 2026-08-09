@@ -98,6 +98,9 @@
 #include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
+#if PG_MAJORVERSION_NUM >= 18
+#include "storage/aio_subsys.h"
+#endif
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/dsm.h"
@@ -258,6 +261,23 @@ WalRedoMain(int argc, char *argv[])
 	SetConfigOption("client_min_messages", "ERROR", PGC_SUSET,
 					PGC_S_OVERRIDE);
 
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * v18 performs every buffer read through the AIO subsystem, whose default
+	 * method ("worker") hands IOs off to io worker processes. There is no
+	 * postmaster here to run them, and the seccomp filter installed below
+	 * permits only a handful of syscalls, so ask for synchronous execution.
+	 *
+	 * Nothing is lost by this: inmem_startreadv() serves pages straight out of
+	 * the in-memory page array and completes the IO itself, so no actual IO is
+	 * ever submitted.
+	 *
+	 * This has to happen before CreateFakeSharedMemoryAndSemaphores(), because
+	 * AioShmemInit() sizes its shared state according to the chosen method.
+	 */
+	SetConfigOption("io_method", "sync", PGC_POSTMASTER, PGC_S_OVERRIDE);
+#endif
+
 	/*
 	 * WAL redo does not need a large number of buffers. And speed of
 	 * DropRelationAllLocalBuffers() is proportional to the number of
@@ -269,8 +289,17 @@ WalRedoMain(int argc, char *argv[])
 	/*
 	 * install the simple in-memory smgr
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * v18 has no smgr_hook/smgr_init_hook. Register the in-memory smgr, which
+	 * claims every relation via its smgr_owns(), and initialise it directly.
+	 */
+	smgr_register_inmem();
+	smgr_init_inmem();
+#else
 	smgr_hook = smgr_inmem;
 	smgr_init_hook = smgr_init_inmem;
+#endif
 
 #if PG_VERSION_NUM >= 160000
 	/* make rmgr registry believe we can register the resource manager */
@@ -285,6 +314,18 @@ WalRedoMain(int argc, char *argv[])
 	max_parallel_workers = 0;
 	max_wal_senders = 0;
 	InitializeMaxBackends();
+
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * v18 keeps postmaster child slots in a pool that MaxLivePostmasterChildren()
+	 * requires, and several shmem sizing routines call it. Standalone backends
+	 * initialize it too; see PostgresSingleUserProcessMain().
+	 */
+	InitPostmasterChildSlots();
+
+	/* v18 sizes the fast-path lock cache at startup */
+	InitializeFastPathLocks();
+#endif
 
 #if PG_VERSION_NUM >= 150000
 	process_shmem_requests();
@@ -314,6 +355,32 @@ WalRedoMain(int argc, char *argv[])
 	 * this before we can use LWLocks.
 	 */
 	InitAuxiliaryProcess();
+
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * v18 reads buffers through the AIO subsystem, and every entry point there
+	 * dereferences pgaio_my_backend. That pointer is set up by
+	 * pgaio_init_backend(), which normally runs from InitPostgres(); this
+	 * process does its own initialization and never gets there, so call it
+	 * here. It needs MyProc and MyProcNumber, hence after InitAuxiliaryProcess()
+	 * and before anything touches a buffer.
+	 */
+	pgaio_init_backend();
+
+	/*
+	 * v18 split the per-backend halves out of the shared memory init routines
+	 * this process calls above. InitLocks() used to create both the shared lock
+	 * hashes and this backend's LOCALLOCK hash; LockManagerShmemInit() only does
+	 * the former, and without the latter LockAcquire() dereferences a NULL
+	 * hashtable as soon as redo takes a relation extension lock.
+	 *
+	 * InitBufferManagerAccess() likewise sets up the private refcount hash and
+	 * MaxProportionalPins, which v18's read path consults when deciding how many
+	 * buffers it may pin.
+	 */
+	InitBufferManagerAccess();
+	InitLockManagerAccess();
+#endif
 
 	SetProcessingMode(NormalProcessing);
 
@@ -531,32 +598,54 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
+	/* v18 renamed InitBufferPool() to BufferManagerShmemInit() */
+#if PG_MAJORVERSION_NUM >= 18
+	BufferManagerShmemInit();
+#else
 	InitBufferPool();
+#endif
 
 	/*
 	 * Set up lock manager
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	LockManagerShmemInit();
+#else
 	InitLocks();
+#endif
 
 	/*
 	 * Set up predicate lock manager
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	PredicateLockShmemInit();
+#else
 	InitPredicateLocks();
+#endif
 
 	/*
 	 * Set up process table
 	 */
 	if (!IsUnderPostmaster)
 		InitProcGlobal();
+#if PG_MAJORVERSION_NUM >= 18
+	ProcArrayShmemInit();
+	BackendStatusShmemInit();
+#else
 	CreateSharedProcArray();
 	CreateSharedBackendStatus();
+#endif
 	TwoPhaseShmemInit();
 	BackgroundWorkerShmemInit();
 
 	/*
 	 * Set up shared-inval messaging
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	SharedInvalShmemInit();
+#else
 	CreateSharedInvalidationState();
+#endif
 
 	/*
 	 * Set up interprocess signaling mechanisms
@@ -583,6 +672,10 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	/* Skip due to the 'pg_notify' directory check */
 	/* AsyncShmemInit(); */
+#if PG_MAJORVERSION_NUM >= 18
+	/* v18 performs all buffer reads through the AIO subsystem */
+	AioShmemInit();
+#endif
 
 #ifdef EXEC_BACKEND
 
@@ -830,7 +923,16 @@ ApplyRecord(StringInfo input_message)
 	 */
 	lsn = pq_getmsgint64(input_message);
 
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * v18's smgrinit() ends with on_proc_exit(smgrshutdown, 0), and this runs
+	 * once per record, so it would exhaust the MAX_ON_EXITS (20) slots. Reset
+	 * the one smgr this process has instead.
+	 */
+	smgr_init_inmem();
+#else
 	smgrinit();					/* reset inmem smgr state */
+#endif
 
 	/* note: the input must be aligned here */
 	record = (XLogRecord *) pq_getmsgbytes(input_message, sizeof(XLogRecord));

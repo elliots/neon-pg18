@@ -1,0 +1,10 @@
+Intentionally empty.
+
+pgaudit 18.0 already suppresses logging in parallel workers upstream, so the
+parallel_workers patch carried for v14..v17 is not needed here -- applying it
+fails with "Reversed (or previously applied) patch detected".
+
+This file exists so that the unconditional COPY of
+compute/patches/pgaudit-parallel_workers-${PG_VERSION}.patch in
+compute/compute-node.Dockerfile still resolves for v18. The Dockerfile skips
+applying it for v18; see the comment there.

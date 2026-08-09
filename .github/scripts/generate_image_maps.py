@@ -19,10 +19,12 @@ components = {
         "compute-node-v15",
         "compute-node-v16",
         "compute-node-v17",
+        "compute-node-v18",
         "vm-compute-node-v14",
         "vm-compute-node-v15",
         "vm-compute-node-v16",
         "vm-compute-node-v17",
+        "vm-compute-node-v18",
     ],
 }
 

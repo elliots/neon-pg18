@@ -1646,8 +1646,17 @@ pg_init_libpagestore(void)
 	if (pageserver_connstring[0])
 	{
 		neon_log(PageStoreTrace, "set neon_smgr hook");
+#if PG_MAJORVERSION_NUM >= 18
+		/*
+		 * v18 has no smgr_hook/smgr_init_hook; smgr_init_neon() registers the
+		 * Neon smgr with smgrregister() instead. smgrinit() runs per backend
+		 * after shared_preload_libraries, so registering here is in time.
+		 */
+		smgr_init_neon();
+#else
 		smgr_hook = smgr_neon;
 		smgr_init_hook = smgr_init_neon;
+#endif
 		dbsize_hook = neon_dbsize;
 	}
 

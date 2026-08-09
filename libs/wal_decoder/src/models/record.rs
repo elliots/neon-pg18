@@ -48,6 +48,16 @@ pub enum NeonWalRecord {
         trunc_offs: usize,
     },
 
+    /// Set this multixact's offset and the next multixact's offset, when both
+    /// live on the same SLRU page. v18's RecordNewMultiXact() writes both, so
+    /// that the last multixact's member count can be derived from the SLRU
+    /// alone. Emitting them as one record keeps a single write per key per LSN.
+    MultixactOffsetCreatePair {
+        mid: MultiXactId,
+        moff: MultiXactOffset,
+        next_moff: MultiXactOffset,
+    },
+
     /// A testing record for unit testing purposes. It supports append data to an existing image, or clear it.
     #[cfg(feature = "testing")]
     Test {
