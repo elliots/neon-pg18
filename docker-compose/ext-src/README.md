@@ -32,7 +32,6 @@ This directory includes the following extensions:
 - `pg_tiktoken-src` - OpenAI Tiktoken tokenizer
 - `pg_uuidv7-src` - UUIDv7 implementation for PostgreSQL
 - `pgjwt-src` - JWT tokens for PostgreSQL
-- `pgrag-src` - Retrieval Augmented Generation for PostgreSQL
 - `pgtap-src` - Unit testing framework for PostgreSQL
 - `pgvector-src` - Vector similarity search
 - `pgx_ulid-src` - ULID data type
