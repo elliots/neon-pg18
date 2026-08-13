@@ -157,7 +157,16 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/neondatabase/build-tools:pinned-bookworm
-      options: --init --user root
+      # --user root because a GitHub-hosted runner's workspace is not writable by
+      # the image's own uid, and actions/checkout would fail. Postgres refuses to
+      # run as root, so the steps that start one drop back to nonroot -- see the
+      # chown step below.
+      #
+      # --shm-size and --ulimit as upstream's _build-and-test-locally.yml sets
+      # them: docker's default 64MB /dev/shm is not enough for the parallel
+      # workers' dynamic shared memory, and tokio-epoll-uring accounts its rings
+      # against the locked-memory limit.
+      options: --init --user root --shm-size=512mb --ulimit memlock=67108864:67108864
     strategy:
       fail-fast: false
       matrix:
@@ -183,9 +192,22 @@ jobs:
           zstd -d -c neon-build.tar.zst | tar -xf -
           chmod +x target/debug/*
 
+      - name: Hand the workspace to nonroot
+        run: |
+          # Everything above ran as root, so the tree is root-owned. initdb and
+          # pg_ctl refuse to run as root ("cannot be run as root ... log in as the
+          # unprivileged user that will own the server process"), and the suite
+          # starts a compute per test, so the remaining steps run as nonroot --
+          # the uid this image is built around, with pyenv and cargo already on
+          # its PATH.
+          chown -R nonroot:nonroot "$GITHUB_WORKSPACE"
+          runuser -u nonroot -- git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install the Python test dependencies
         run: |
-          ./scripts/pysync
+          # HOME too: poetry caches its virtualenv there, and root's is not
+          # readable by nonroot in the step that follows.
+          runuser -u nonroot -- env HOME=/home/nonroot PATH="$PATH" ./scripts/pysync
 
       - name: Run the regression suite
         env:
@@ -198,7 +220,9 @@ jobs:
           # DEFAULT_PG_VERSION wants the bare major number, PG_VERSION is v-prefixed.
           export DEFAULT_PG_VERSION="${PG_VERSION#v}"
           export LD_LIBRARY_PATH="${POSTGRES_DISTRIB_DIR}/${PG_VERSION}/lib"
-          mkdir -p "$TEST_OUTPUT"
+          # Owned by nonroot: this step still runs as root, but the suite writes
+          # here as nonroot.
+          install -d -o nonroot -g nonroot "$TEST_OUTPUT"
           # Deterministic round-robin over the test files, so a shard always
           # covers the same set and a failure is reproducible by re-running
           # that shard alone.
@@ -213,13 +237,15 @@ jobs:
           printf '  %s\n' "${FILES[@]}"
           # --timeout: a test that needs longer than this is a finding in itself,
           # and waiting on it just idles a worker.
-          ./scripts/pytest \
-            -v -rf \
-            -p no:cacheprovider \
-            -n "$(nproc)" --dist=loadgroup \
-            --timeout=600 \
-            --junit-xml="${TEST_OUTPUT}/junit-shard-${SHARD}.xml" \
-            "${FILES[@]}"
+          runuser -u nonroot -- env HOME=/home/nonroot PATH="$PATH" \
+            DEFAULT_PG_VERSION="$DEFAULT_PG_VERSION" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            ./scripts/pytest \
+              -v -rf \
+              -p no:cacheprovider \
+              -n "$(nproc)" --dist=loadgroup \
+              --timeout=600 \
+              --junit-xml="${TEST_OUTPUT}/junit-shard-${SHARD}.xml" \
+              "${FILES[@]}"
 
       - name: Upload the results
         if: always()
