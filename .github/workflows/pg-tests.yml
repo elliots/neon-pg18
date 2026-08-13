@@ -137,11 +137,16 @@ jobs:
           # pg_regress and isolationtester are run out of the build tree.
           mkdir -p artifact/build
           cp -a "build/${PG_VERSION}" "artifact/build/${PG_VERSION}"
-          for b in pageserver safekeeper storage_broker storage_controller \
-                   neon_local compute_ctl endpoint_storage pagectl \
-                   storage_scrubber storcon_cli; do
-            [ -x "target/debug/$b" ] && cp "target/debug/$b" artifact/target/debug/
+          # Everything cargo produced, not a hand-written list. The list I had
+          # here omitted proxy, local_proxy, pg_sni_router and
+          # test_helper_slow_client_reads, which the suite invokes by path -- so
+          # those tests failed with FileNotFoundError rather than with anything
+          # that pointed at the packaging.
+          for b in target/debug/*; do
+            [ -f "$b" ] && [ -x "$b" ] && cp "$b" artifact/target/debug/
           done
+          echo "staged $(ls artifact/target/debug | wc -l) binaries:"
+          ls artifact/target/debug
           tar -C artifact -cf - . | zstd -T0 -3 -o neon-build.tar.zst
 
       - uses: actions/upload-artifact@v4
@@ -257,6 +262,28 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      # Without this a failure is only as diagnosable as whatever pytest chose to
+      # print: the interesting part -- the compute's log, the pageserver's log,
+      # the stderr of a pg_bin command that exited non-zero -- is written to
+      # files under test_output and thrown away with the runner.
+      - name: Collect the logs of a failed run
+        if: failure()
+        run: |
+          find test_output \
+            \( -name '*.log' -o -name '*.stderr' -o -name '*.stdout' \
+               -o -name 'regression.diffs' -o -name 'regression.out' \) \
+            -size -20M -print0 | tar --null -T - -czf test-logs.tar.gz || true
+          ls -lh test-logs.tar.gz || true
+
+      - name: Upload the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-shard-${{ matrix.shard }}
+          path: test-logs.tar.gz
+          retention-days: 14
+          if-no-files-found: warn
+
   report:
     name: report
     needs: test
@@ -300,15 +327,30 @@ jobs:
                   print(f"\n...and {len(bad) - 100} more.")
           PY
 
+      # `if: always()` means this job also runs when the shards were cancelled or
+      # died before uploading anything -- in which case the check below sees no
+      # results, counts no failures and passes. A run where nothing executed must
+      # not report success, so take the shards' own conclusion first.
+      - name: Fail if the shards did not all succeed
+        if: needs.test.result != 'success'
+        run: |
+          echo "test jobs concluded: ${{ needs.test.result }}"
+          exit 1
+
       - name: Fail if any test failed
         run: |
           python3 - <<'PY'
           import glob, sys, xml.etree.ElementTree as ET
-          bad = 0
-          for fn in glob.glob("results/**/junit-*.xml", recursive=True):
+          files = glob.glob("results/**/junit-*.xml", recursive=True)
+          if not files:
+              sys.exit("no junit files: the shards produced no results at all")
+          bad = total = 0
+          for fn in files:
               root = ET.parse(fn).getroot()
               ts = root if root.tag == "testsuite" else root[0]
-              bad += sum(1 for tc in ts for c in tc if c.tag in ("failure", "error"))
-          print(f"{bad} failing tests")
+              for tc in ts:
+                  total += 1
+                  bad += sum(1 for c in tc if c.tag in ("failure", "error"))
+          print(f"{bad} failing tests out of {total}, from {len(files)} shards")
           sys.exit(1 if bad else 0)
           PY

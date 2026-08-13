@@ -633,6 +633,10 @@ Building and testing surfaced three pre-existing problems:
 - **`walproposer-lib`** is still built against v17 only. That is a deliberate
   single-version choice predating this work, not a v18 gap.
 - **Extension coverage**: see the "not built on v18" list above.
+- **Sanitizers are not wired into CI.** The v18 run in §10 found nothing, but it
+  was done by hand; `build_and_test_with_sanitizers.yml` sits in
+  `.github/workflows-disabled/` with the rest of the inherited workflows, and it
+  is pinned to v17 in any case. Nothing will notice a regression here.
 
 ---
 
@@ -659,6 +663,40 @@ for v in v17 v18; do
   clang -I"$(pg_install/$v/bin/pg_config --includedir-server)" -o /tmp/p_$v probe.c && /tmp/p_$v
 done
 ```
+
+### Sanitizers
+
+`build_and_test_with_sanitizers.yml` pins `test-cfg` to `v17`, so the v18 C code
+— the AIO entry points, the walredo changes, the unlogged-build tracking — had
+never run under ASan/UBSan. That is a configuration choice, not a limitation:
+`WITH_SANITIZERS=yes` builds v18 as readily as v17.
+
+Built with `-fsanitize=address,undefined -fno-sanitize-recover`, so a finding
+aborts the process rather than logging and continuing — it shows up as a dead
+compute, not as a line in a log. 26 tests were run against it: the paths this
+port changed (`test_wal_restore`, `test_recovery`, `test_multixact`,
+`test_clog_truncate`, `test_subxacts`, `test_unlogged`,
+`test_parallel_index_build`, `test_gin_redo`,
+`test_nbtree_pagesplit_cycleid`, `test_vm_truncate`), then `pg_regress`,
+`isolation` and `sql_regress`. **No findings.**
+
+Two traps worth knowing, both of which produced a meaningless green run first:
+
+```sh
+# 1. Check you are actually running the instrumented build. A run against an
+#    unsanitized one looks identical.
+nm -D --undefined-only $DISTRIB/v18/lib/postgresql/neon.so | grep -c '__asan\|__ubsan'
+nm $DISTRIB/v18/bin/postgres | grep -c '__asan\|__ubsan'
+
+# 2. test_pg_regress derives its binaries as $POSTGRES_DISTRIB_DIR/../build/vNN,
+#    and ".." is applied after symlinks resolve -- so a symlinked pg_install
+#    silently picks the ordinary pg_regress back up. Point it at a real
+#    directory whose sibling is the sanitized build tree.
+readlink -f $POSTGRES_DISTRIB_DIR/../build/v18/src/test/regress/pg_regress
+```
+
+`ASAN_OPTIONS=detect_leaks=0`, as the Makefile sets: Postgres frees by tearing
+down memory contexts at exit, so leak-checking reports only noise.
 
 To compile an extension against the v18 tree without building the whole image:
 
