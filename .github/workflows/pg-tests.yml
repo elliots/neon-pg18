@@ -42,6 +42,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# As the upstream workflows do. Without this, `run:` steps in a container job get
+# /bin/sh, which on bookworm is dash: no arrays, no process substitution. pipefail
+# also matters here, since several steps end in a pipe whose first command is the
+# one that can fail.
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
 # Nothing here publishes anything. Keep the token read-only; the disabled
 # upstream workflows asked for packages:write, which a fork cannot grant unless
 # the repository's default workflow permissions are raised.
@@ -79,7 +87,6 @@ jobs:
 
       - name: Check out the Postgres submodules
         run: |
-          set -eux
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # postgres_ffi generates bindings for every supported version, so the
           # headers for all of them are needed even when testing just one.
@@ -107,13 +114,11 @@ jobs:
 
       - name: Build Postgres and the Neon extensions
         run: |
-          set -eux
           make -j"$(nproc)" postgres-install-"${PG_VERSION}"
           make -j"$(nproc)" neon-pg-ext-"${PG_VERSION}"
 
       - name: Build the Neon binaries
         run: |
-          set -eux
           make -j"$(nproc)" neon \
             CARGO_BUILD_FLAGS="--locked --features ${CARGO_FEATURES}"
           # Fail loudly rather than skipping 274 tests at run time.
@@ -122,13 +127,11 @@ jobs:
       - name: Plan the test shards
         id: plan
         run: |
-          set -eu
           n="${{ inputs.shards || '6' }}"
           echo "shards=$(python3 -c "import json;print(json.dumps(list(range(1,$n+1))))")" >> "$GITHUB_OUTPUT"
 
       - name: Package what the test jobs need
         run: |
-          set -eux
           mkdir -p artifact/target/debug
           cp -a pg_install artifact/
           # pg_regress and isolationtester are run out of the build tree.
@@ -166,7 +169,6 @@ jobs:
 
       - name: Check out the Postgres submodule under test
         run: |
-          set -eux
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # test_pg_regress and test_isolation read their schedules and expected
           # output straight out of the Postgres source tree.
@@ -178,13 +180,11 @@ jobs:
 
       - name: Unpack the build
         run: |
-          set -eux
           zstd -d -c neon-build.tar.zst | tar -xf -
           chmod +x target/debug/*
 
       - name: Install the Python test dependencies
         run: |
-          set -eux
           ./scripts/pysync
 
       - name: Run the regression suite
@@ -195,7 +195,6 @@ jobs:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ inputs.shards || '6' }}
         run: |
-          set -eu
           # DEFAULT_PG_VERSION wants the bare major number, PG_VERSION is v-prefixed.
           export DEFAULT_PG_VERSION="${PG_VERSION#v}"
           export LD_LIBRARY_PATH="${POSTGRES_DISTRIB_DIR}/${PG_VERSION}/lib"
@@ -204,6 +203,12 @@ jobs:
           # covers the same set and a failure is reproducible by re-running
           # that shard alone.
           mapfile -t FILES < <(printf '%s\n' test_runner/regress/test_*.py | sort | awk "NR % $SHARDS == $SHARD % $SHARDS")
+          # An empty list would make pytest collect the whole suite in this shard
+          # rather than fail, so check instead of trusting the glob.
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "shard $SHARD/$SHARDS matched no test files" >&2
+            exit 1
+          fi
           echo "shard $SHARD/$SHARDS covers ${#FILES[@]} files"
           printf '  %s\n' "${FILES[@]}"
           # --timeout: a test that needs longer than this is a finding in itself,
@@ -271,7 +276,6 @@ jobs:
 
       - name: Fail if any test failed
         run: |
-          set -eu
           python3 - <<'PY'
           import glob, sys, xml.etree.ElementTree as ET
           bad = 0
