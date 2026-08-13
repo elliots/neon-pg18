@@ -607,7 +607,7 @@ changes. It is gated behind `neon.unstable_extensions` regardless.
 
 ## 8. Bugs found that have nothing to do with PostgreSQL 18
 
-Building and testing surfaced three pre-existing problems:
+Building and testing surfaced five pre-existing problems:
 
 1. **`h3-pg` moved from `zachasme/h3-pg` to the `postgis` org** and the tags went
    with it, so the pinned URL 404s for *every* Postgres version. Contents are
@@ -621,6 +621,21 @@ Building and testing surfaced three pre-existing problems:
    41s after SIGTERM, with no clients connected. `neon_local` allows 10s, so every
    test that stops the service fails in teardown and leaks processes until ports
    run out. The drain now has a bounded budget.
+4. **`test_pageserver_getpage_throttle` hardcoded `PgVersion.V16`** when creating
+   its timeline, so the pageserver looked for `pg_install/v16/bin/initdb` and the
+   test failed with `run initdb: Error spawning command: NotFound` on any tree
+   that does not build v16 — whatever version was nominally under test. Upstream
+   CI builds every version, so it never showed there. The version is incidental
+   to a test about the getpage rate limit; it now uses the version under test.
+5. **`test_nbtree_pagesplit_cycleid` asserted an exact count from a race.** It
+   synchronises with a concurrent vacuum through `time.sleep(2)` and then
+   requires exactly three cycle-ID-stamped splits. The number depends on how far
+   that vacuum got: on v18, whose read-stream `btvacuumscan` reads further ahead,
+   it is 2 on an idle machine and 3 on a loaded CI runner. Both are correct, and
+   the property being tested — that concurrent splits are stamped at all — holds
+   either way. Worth noticing before concluding that a count difference is a
+   version difference: it is the kind of test that will happily attribute a busy
+   machine to a Postgres change.
 
 ---
 
