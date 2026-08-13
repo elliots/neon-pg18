@@ -35,7 +35,7 @@ on:
       shards:
         description: Number of parallel test shards
         required: false
-        default: "6"
+        default: "10"
         type: string
 
 concurrency:
@@ -127,7 +127,7 @@ jobs:
       - name: Plan the test shards
         id: plan
         run: |
-          n="${{ inputs.shards || '6' }}"
+          n="${{ inputs.shards || '10' }}"
           echo "shards=$(python3 -c "import json;print(json.dumps(list(range(1,$n+1))))")" >> "$GITHUB_OUTPUT"
 
       - name: Package what the test jobs need
@@ -160,6 +160,10 @@ jobs:
     name: test ${{ inputs.pg_version || 'v18' }} (shard ${{ matrix.shard }})
     needs: build
     runs-on: ubuntu-latest
+    # A hung shard otherwise runs to GitHub's 6-hour default and then has its
+    # logs discarded ("BlobNotFound"), so it costs six hours and tells you
+    # nothing. Shards that finish take 25-45 minutes.
+    timeout-minutes: 75
     container:
       image: ghcr.io/neondatabase/build-tools:pinned-bookworm
       # --user root because a GitHub-hosted runner's workspace is not writable by
@@ -220,7 +224,7 @@ jobs:
           POSTGRES_DISTRIB_DIR: ${{ github.workspace }}/pg_install
           TEST_OUTPUT: ${{ github.workspace }}/test_output
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ inputs.shards || '6' }}
+          SHARDS: ${{ inputs.shards || '10' }}
         run: |
           # DEFAULT_PG_VERSION wants the bare major number, PG_VERSION is v-prefixed.
           export DEFAULT_PG_VERSION="${PG_VERSION#v}"
@@ -242,12 +246,19 @@ jobs:
           printf '  %s\n' "${FILES[@]}"
           # --timeout: a test that needs longer than this is a finding in itself,
           # and waiting on it just idles a worker.
+          # -n 2, not $(nproc). A github-hosted runner has 4 vCPUs, and every test
+          # starts a pageserver, a safekeeper, a broker, a storage controller and
+          # a compute -- so one worker per core oversubscribes it several times
+          # over. That shows up as timing failures rather than as slowness:
+          # endpoints that do not shut down within neon_local's grace period, then
+          # `endpoint start` failing with "Directory not empty" because the old
+          # compute is still writing into pgdata while it is being removed.
           runuser -u nonroot -- env HOME=/home/nonroot PATH="$PATH" \
             DEFAULT_PG_VERSION="$DEFAULT_PG_VERSION" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
             ./scripts/pytest \
               -v -rf \
               -p no:cacheprovider \
-              -n "$(nproc)" --dist=loadgroup \
+              -n 2 --dist=loadgroup \
               --timeout=600 \
               --junit-xml="${TEST_OUTPUT}/junit-shard-${SHARD}.xml" \
               "${FILES[@]}"

@@ -8,7 +8,6 @@ import pytest
 from anyio import Path
 from fixtures.common_types import TenantId, TimelineId
 from fixtures.log_helper import log
-from fixtures.pg_version import PgVersion
 from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
@@ -48,7 +47,12 @@ def test_pageserver_getpage_throttle(neon_env_builder: NeonEnvBuilder, pg_bin: P
 
     ps_http = env.pageserver.http_client()
 
-    ps_http.timeline_create(PgVersion.V16, tenant_id, timeline_id)
+    # The version is incidental here -- this test is about the getpage rate
+    # limit, not about anything version-specific. Hardcoding V16 means the
+    # pageserver looks for pg_install/v16/bin/initdb, so the test fails with
+    # "run initdb: Error spawning command: NotFound" anywhere that does not
+    # build v16, whatever version is actually under test.
+    ps_http.timeline_create(env.pg_version, tenant_id, timeline_id)
 
     def run_pagebench_at_max_speed_and_get_total_requests_completed(duration_secs: int):
         cmd = [
