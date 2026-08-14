@@ -174,8 +174,14 @@ jobs:
     runs-on: ubuntu-latest
     # A hung shard otherwise runs to GitHub's 6-hour default and then has its
     # logs discarded ("BlobNotFound"), so it costs six hours and tells you
-    # nothing. Shards that finish take 25-45 minutes.
-    timeout-minutes: 75
+    # nothing.
+    #
+    # Most shards take 25-45 minutes. The one holding test_pg_regress.py is the
+    # long pole and needs roughly twice that: it is a dozen heavy
+    # parametrisations (pg_regress, isolation and sql_regress, each over two
+    # protocol versions and two shard counts) and sharding is per-file, so they
+    # cannot be spread out. 75 minutes killed it mid-run.
+    timeout-minutes: 120
     container:
       image: ghcr.io/neondatabase/build-tools:pinned-bookworm
       # --user root because a GitHub-hosted runner's workspace is not writable by
@@ -290,7 +296,10 @@ jobs:
       # the stderr of a pg_bin command that exited non-zero -- is written to
       # files under test_output and thrown away with the runner.
       - name: Collect the logs of a failed run
-        if: failure()
+        # always(), not failure(): a shard killed by timeout-minutes is
+        # "cancelled", and failure() would skip it -- losing the logs of the one
+        # run whose logs are most wanted.
+        if: always()
         run: |
           find test_output \
             \( -name '*.log' -o -name '*.stderr' -o -name '*.stdout' \
@@ -299,7 +308,7 @@ jobs:
           ls -lh test-logs.tar.gz || true
 
       - name: Upload the logs of a failed run
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-shard-${{ matrix.shard }}
