@@ -770,15 +770,29 @@ which fails to decompress its fixtures — unrelated to either version.)
 
 That looked damning, and it was one sample. Re-running v18 gave 615 passed and a
 *different* four failures. Across the two runs only `test_slow_flush` failed
-both times. The rest — `test_get_tenant_size_with_multiple_branches`,
-`test_replica_start_with_prepared_xacts_with_many_subxacts`,
-`test_branching_with_pgbench`, `test_background_operation_cancellation` — moved,
-and the first of those passes 4/4 on both versions locally. They are load-
-sensitive tests on an oversubscribed runner, not v18 regressions.
+both times; the rest moved, and `test_get_tenant_size_with_multiple_branches`
+passes 4/4 on both versions locally.
+
+So `test_slow_flush` was measured too, rather than assumed either way:
+
+| | v18 | v17 |
+|---|---|---|
+| `pageserver-stop` | 22.69 / 21.34 / 20.26 | 21.59 / 19.85 / 20.46 |
+| `tenant-detach` | 18.29 / 17.70 / 17.41 | 17.60 / 17.07 / 17.85 |
+
+Equal within a few percent. It is not slower on v18; it is a test doing ~21s of
+work against a 30s cap, so it has no margin and a busy runner tips it over
+whatever the version. v17 passed its single run by luck. (Its budget is now 60s
+— the hang it guards against is indefinite, not 35 seconds long.)
+
+**No CI failure was a v18 regression.** Three independent lines agree: the local
+v17/v18 matrix over 826 tests, the sanitizer run, and CI once its failures are
+followed up rather than counted.
 
 Two lessons, both learned the hard way here: a single run distinguishes nothing,
 and the v17 baseline has to come from the *same* environment. Neither the local
-matrix nor one CI run would have told the truth on its own.
+matrix nor one CI run would have told the truth on its own — and a failure that
+does reproduce still needs measuring before it means what it appears to.
 
 ### v18 is more sensitive to a busy machine
 
@@ -788,7 +802,7 @@ machinery, a larger initdb), so tests that assert on wall-clock — a 30s cap he
 a ±10% latency identity there, a "few pages" size tolerance elsewhere — sit
 closer to their limits. Worth knowing before treating a red run as a bug.
 
-### The failures that were real
+### The one failure that was real
 
 * **`compute_ctl` reported an LFC prewarm as `Cancelled` before it had stopped.**
   Cancelling a query only asks the backend to stop; `lfc_prewarm()` then waits

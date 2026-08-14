@@ -8,7 +8,18 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import NeonEnvBuilder
 
 
-@pytest.mark.timeout(30)  # test takes <20s if pageserver impl is correct
+# Upstream had 30s here, with the note that the test takes <20s if the pageserver
+# implementation is correct. That is still true, and it is the problem: measured
+# on an idle machine this takes 20-23s (pageserver-stop) and 17-18s
+# (tenant-detach), on v17 and v18 alike -- within a few percent of each other, so
+# nothing version-specific. There is simply no margin, and on the 4-vCPU runners
+# this fork's CI uses it goes over 30s and fails for reasons that have nothing to
+# do with what it tests.
+#
+# What it guards against is a shutdown that blocks forever on a response flush
+# that TCP has backpressured. That failure mode is an indefinite hang, not a
+# 35-second one, so a larger budget still catches it.
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("kind", ["pageserver-stop", "tenant-detach"])
 def test_slow_flush(neon_env_builder: NeonEnvBuilder, neon_binpath: Path, kind: str):
     def patch_pageserver_toml(config):
