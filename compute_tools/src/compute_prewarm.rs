@@ -154,12 +154,24 @@ impl ComputeNode {
         let pg_token = client.cancel_token();
 
         let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![&uncompressed];
+        let query = client.query_one("select neon.prewarm_local_cache($1)", &params);
+        tokio::pin!(query);
         select! {
-            res = client.query_one("select neon.prewarm_local_cache($1)", &params) => res,
+            res = &mut query => res,
             _ = token.cancelled() => {
                 pg_token.cancel_query(postgres::NoTls).await
                     .context("cancelling neon.prewarm_local_cache()")?;
-                return Ok(LfcPrewarmState::Cancelled)
+                // Wait for the backend to actually finish before reporting
+                // Cancelled. Cancelling the query only asks it to stop:
+                // lfc_prewarm() then waits for each of its background workers to
+                // shut down, and only clears lfc_ctl->prewarm_active afterwards.
+                // Returning here without waiting means a caller that starts
+                // another prewarm as soon as it sees Cancelled -- which is the
+                // obvious thing to do, and what test_lfc_prewarm_cancel does --
+                // gets "LFC: skip prewarm because another prewarm is still
+                // active" from a prewarm that is, by then, meant to be over.
+                let _ = query.await;
+                return Ok(LfcPrewarmState::Cancelled);
             }
         }
         .context("loading LFC state into postgres")
