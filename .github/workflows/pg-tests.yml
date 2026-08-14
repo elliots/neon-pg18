@@ -269,17 +269,19 @@ jobs:
           # Owned by nonroot: this step still runs as root, but the suite writes
           # here as nonroot.
           install -d -o nonroot -g nonroot "$TEST_OUTPUT"
-          # The "regress" shard runs test_pg_regress.py and nothing else, with
-          # more workers: its tests spend most of their time waiting on a
-          # pageserver and a compute rather than on this process, so they take
-          # oversubscription better than the suite at large.
+          # The "regress" shard runs test_pg_regress.py and nothing else. What it
+          # buys is a budget of its own, not more parallelism: at four workers
+          # every test_pg_regress parametrisation hit its own 3000s timeout,
+          # because each one drives Postgres's regression schedule, which is
+          # itself parallel and CPU-bound. Four of those on four vCPUs is worse
+          # oversubscription than the arrangement it replaced, not better.
           #
           # Everything else is a deterministic round-robin over the remaining
           # files, so a shard always covers the same set and a failure can be
           # reproduced by re-running that shard alone.
           if [ "$SHARD" = "regress" ]; then
             FILES=(test_runner/regress/test_pg_regress.py)
-            WORKERS=4
+            WORKERS=2
           else
             mapfile -t FILES < <(printf '%s\n' test_runner/regress/test_*.py \
               | grep -v '/test_pg_regress\.py$' | sort | awk "NR % $SHARDS == $SHARD % $SHARDS")
