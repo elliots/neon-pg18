@@ -113,7 +113,9 @@ jobs:
           path: |
             pg_install
             build
-          key: pg-${{ runner.os }}-${{ env.PG_VERSION }}-${{ hashFiles('vendor/revisions.json') }}
+          # The -v2 busts a poisoned entry: a cache key is never overwritten once
+          # it exists, so a half-written tree in there is served forever.
+          key: pg-${{ runner.os }}-${{ env.PG_VERSION }}-v2-${{ hashFiles('vendor/revisions.json') }}
 
       - name: Build Postgres and the Neon extensions
         run: |
@@ -122,8 +124,20 @@ jobs:
           # as a bare "Error 2" with no message at all. Disk exhaustion looks
           # exactly like that, so record the free space rather than guess later.
           df -h . /tmp
+          # A restored cache can hold a half-written build tree. That does not
+          # announce itself: a truncated .deps/*.Po file makes make stop with
+          #
+          #     .deps/multirangetypes.Po:218: *** missing separator.  Stop.
+          #
+          # which looks like a Postgres problem, not a cache problem. Only trust
+          # the tree if the marker written by a completed build is there.
+          if [ ! -f "build/.complete-${PG_VERSION}" ]; then
+            echo "no completion marker for ${PG_VERSION}: discarding any restored tree"
+            rm -rf "build/${PG_VERSION}" "pg_install/${PG_VERSION}"
+          fi
           make -j"$(nproc)" postgres-install-"${PG_VERSION}"
           make -j"$(nproc)" neon-pg-ext-"${PG_VERSION}"
+          mkdir -p build && touch "build/.complete-${PG_VERSION}"
           df -h .
 
       - name: Build the Neon binaries
