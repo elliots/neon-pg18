@@ -150,8 +150,13 @@ jobs:
       - name: Plan the test shards
         id: plan
         run: |
+          # test_pg_regress.py gets a shard to itself ("regress"). It is a dozen
+          # heavy parametrisations that per-file sharding cannot split, and
+          # bundled with an ordinary shard's worth of files it ran past even a
+          # two-hour budget -- killed inside test_isolation, with pg_regress
+          # itself having taken the first hour.
           n="${{ inputs.shards || '10' }}"
-          echo "shards=$(python3 -c "import json;print(json.dumps(list(range(1,$n+1))))")" >> "$GITHUB_OUTPUT"
+          echo "shards=$(python3 -c "import json;print(json.dumps(list(range(1,$n+1))+['regress']))")" >> "$GITHUB_OUTPUT"
 
       - name: Package what the test jobs need
         run: |
@@ -264,10 +269,22 @@ jobs:
           # Owned by nonroot: this step still runs as root, but the suite writes
           # here as nonroot.
           install -d -o nonroot -g nonroot "$TEST_OUTPUT"
-          # Deterministic round-robin over the test files, so a shard always
-          # covers the same set and a failure is reproducible by re-running
-          # that shard alone.
-          mapfile -t FILES < <(printf '%s\n' test_runner/regress/test_*.py | sort | awk "NR % $SHARDS == $SHARD % $SHARDS")
+          # The "regress" shard runs test_pg_regress.py and nothing else, with
+          # more workers: its tests spend most of their time waiting on a
+          # pageserver and a compute rather than on this process, so they take
+          # oversubscription better than the suite at large.
+          #
+          # Everything else is a deterministic round-robin over the remaining
+          # files, so a shard always covers the same set and a failure can be
+          # reproduced by re-running that shard alone.
+          if [ "$SHARD" = "regress" ]; then
+            FILES=(test_runner/regress/test_pg_regress.py)
+            WORKERS=4
+          else
+            mapfile -t FILES < <(printf '%s\n' test_runner/regress/test_*.py \
+              | grep -v '/test_pg_regress\.py$' | sort | awk "NR % $SHARDS == $SHARD % $SHARDS")
+            WORKERS=2
+          fi
           # An empty list would make pytest collect the whole suite in this shard
           # rather than fail, so check instead of trusting the glob.
           if [ "${#FILES[@]}" -eq 0 ]; then
@@ -278,19 +295,20 @@ jobs:
           printf '  %s\n' "${FILES[@]}"
           # --timeout: a test that needs longer than this is a finding in itself,
           # and waiting on it just idles a worker.
-          # -n 2, not $(nproc). A github-hosted runner has 4 vCPUs, and every test
-          # starts a pageserver, a safekeeper, a broker, a storage controller and
-          # a compute -- so one worker per core oversubscribes it several times
-          # over. That shows up as timing failures rather than as slowness:
-          # endpoints that do not shut down within neon_local's grace period, then
-          # `endpoint start` failing with "Directory not empty" because the old
-          # compute is still writing into pgdata while it is being removed.
+          # Two workers, not $(nproc). A github-hosted runner has 4 vCPUs, and
+          # every test starts a pageserver, a safekeeper, a broker, a storage
+          # controller and a compute -- so one worker per core oversubscribes it
+          # several times over. That shows up as timing failures rather than as
+          # slowness: endpoints that do not shut down within neon_local's grace
+          # period, then `endpoint start` failing with "Directory not empty"
+          # because the old compute is still writing into pgdata while it is
+          # being removed.
           runuser -u nonroot -- env HOME=/home/nonroot PATH="$PATH" \
             DEFAULT_PG_VERSION="$DEFAULT_PG_VERSION" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
             ./scripts/pytest \
               -v -rf \
               -p no:cacheprovider \
-              -n 2 --dist=loadgroup \
+              -n "$WORKERS" --dist=loadgroup \
               --timeout=600 \
               --junit-xml="${TEST_OUTPUT}/junit-shard-${SHARD}.xml" \
               "${FILES[@]}"
