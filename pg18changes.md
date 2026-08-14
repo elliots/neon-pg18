@@ -829,3 +829,18 @@ None of these were visible from the failure text alone, which is why the workflo
 now archives `*.log`/`*.stderr` from a failed *or cancelled* run: without that,
 `pgbench ... exit status 1` never reveals that it was `vacuum analyze` hitting
 the test's own `statement_timeout`.
+
+### Shard layout
+
+Ten shards round-robin over the test files, two workers each, plus one shard that
+runs `test_pg_regress.py` alone. That file is a dozen parametrisations that
+per-file sharding cannot split, and it needs about 87 minutes by itself; bundled
+with an ordinary shard's worth of files it ran past a two-hour budget.
+
+Two workers there as well. Four was tried, on the theory that these tests mostly
+wait on a pageserver — they do not: each drives Postgres's own regression
+schedule, which is parallel and CPU-bound, and at four workers every
+parametrisation hit its 3000s timeout.
+
+Settled state: 641 passed, 3 failed, 127 skipped. The three are load artefacts,
+and which three it is changes every run.
