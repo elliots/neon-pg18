@@ -742,3 +742,76 @@ The pattern they share: the new version parses, compiles and runs, and simply
 does not get the behaviour — a stale `wal_level`, a missing `io_method`, a control
 file declared corrupt. None of them fail loudly, so none of them show up in a
 green test run.
+
+---
+
+## 11. What CI says, and how to read it
+
+The fork runs one workflow (`.github/workflows/pg-tests.yml`); everything
+inherited from upstream is disabled, because it wants Neon's self-hosted runners
+and cloud accounts. Ours uses github-hosted machines, which are 4 vCPUs — an
+order of magnitude smaller than what this suite is written for. That shapes every
+result, so it is worth being explicit about what a failure there means.
+
+### Compare against v17 in the same environment, not against a memory of it
+
+The first v18 run that got far enough to produce results had 6 failures, and it
+was tempting to call them environmental — the local v17/v18 matrix had shown no
+v18-only regressions. Dispatching the same workflow at `pg_version=v17` settled
+it properly:
+
+| | v18 | v17 |
+|---|---|---|
+| passed | 613 | 677 |
+| failed | 6 | 2 |
+
+and all six v18 failures passed on v17. (v17's two are `test_historic_storage_formats`,
+which fails to decompress its fixtures — unrelated to either version.)
+
+That looked damning, and it was one sample. Re-running v18 gave 615 passed and a
+*different* four failures. Across the two runs only `test_slow_flush` failed
+both times. The rest — `test_get_tenant_size_with_multiple_branches`,
+`test_replica_start_with_prepared_xacts_with_many_subxacts`,
+`test_branching_with_pgbench`, `test_background_operation_cancellation` — moved,
+and the first of those passes 4/4 on both versions locally. They are load-
+sensitive tests on an oversubscribed runner, not v18 regressions.
+
+Two lessons, both learned the hard way here: a single run distinguishes nothing,
+and the v17 baseline has to come from the *same* environment. Neither the local
+matrix nor one CI run would have told the truth on its own.
+
+### v18 is more sensitive to a busy machine
+
+v17 produced no load failures where v18 produced several, run after run. Nothing
+suggests a correctness difference; v18 simply does more per operation (the AIO
+machinery, a larger initdb), so tests that assert on wall-clock — a 30s cap here,
+a ±10% latency identity there, a "few pages" size tolerance elsewhere — sit
+closer to their limits. Worth knowing before treating a red run as a bug.
+
+### The failures that were real
+
+* **`compute_ctl` reported an LFC prewarm as `Cancelled` before it had stopped.**
+  Cancelling a query only asks the backend to stop; `lfc_prewarm()` then waits
+  for its background workers and only then clears `lfc_ctl->prewarm_active`. A
+  caller that saw `Cancelled` and started another prewarm got "another prewarm is
+  still active". Version-independent — v18 only lost a race v17 usually wins.
+* **`test_pageserver_getpage_throttle` asked for `PgVersion.V16`** (see §8).
+
+### The workflow's own bugs, which outnumbered the port's
+
+Worth listing, because each one presented as something else entirely:
+
+| symptom | cause |
+|---|---|
+| `Syntax error: redirection unexpected` | `run:` steps get `/bin/sh` (dash), not bash |
+| `pg_ctl: cannot be run as root` | container runs as root so checkout can write |
+| `FileNotFoundError: target/debug/proxy` | packaged a hand-written subset of the binaries |
+| a shard burning 6 hours | no `timeout-minutes`; logs then discarded as `BlobNotFound` |
+| `report` green on a run that tested nothing | `if: always()` plus counting failures in zero files |
+| `.deps/multirangetypes.Po: missing separator` | a half-written build tree served from the cache forever |
+| statement timeouts, `Directory not empty` | `-n $(nproc)` on a 4-vCPU runner |
+
+None of these were visible from the failure text alone, which is why the workflow
+now archives `*.log`/`*.stderr` from a failed *or cancelled* run: without that,
+`pgbench ... exit status 1` never reveals that it was `vacuum analyze` hitting
+the test's own `statement_timeout`.
